@@ -1,0 +1,16 @@
+{
+  "name": "nexusvoice-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whatsmeow-node/whatsmeow-node": "^0.7.0",
+    "telegram": "^2.26.0",
+    "pg": "^8.11.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
