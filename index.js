@@ -33,17 +33,9 @@ const adminPool = new Pool({ connectionString: SUPABASE_DB_URL });
    WHATSAPP STATE (strictly device-based)
    ═══════════════════════════════════════════════════════════════ */
 
-// In-memory WhatsApp clients, keyed by "userId:deviceId".
 const waClients = new Map();
-
-// userId -> deviceId that is currently paired. When a request arrives with a
-// different deviceId, the old pairing is invalidated before the new one is
-// created.
 const waPairedDevice = new Map();
-
-// Track in-flight pairing attempts so concurrent /pair calls don't stomp
-// on each other.
-const waPairingInFlight = new Map(); // userId -> Promise
+const waPairingInFlight = new Map();
 
 function waCacheKey(userId, deviceId) {
   return `${userId}:${deviceId}`;
@@ -106,8 +98,6 @@ async function waDropClient(userId, deviceId) {
 async function getOrCreateWaClient(userId, deviceId) {
   const key = waCacheKey(userId, deviceId);
 
-  // Strictly device-based: if this user is paired on another device, drop
-  // the old pairing before creating the new one.
   const knownDevice = waPairedDevice.get(userId);
   if (knownDevice && knownDevice !== deviceId) {
     console.log(`[WA ${userId}] device changed ${knownDevice} -> ${deviceId}, invalidating`);
@@ -121,7 +111,7 @@ async function getOrCreateWaClient(userId, deviceId) {
   const storeUrl = await waStoreUrlForUser(userId, deviceId);
   const client = createClient({
     store: storeUrl,
-    commandTimeout: 60000, // bumped from 120000? keep 120s for initial sync
+    commandTimeout: 120000,
   });
 
   const entry = { client, jid: null, connected: false, deviceId, loggedOut: false };
@@ -140,8 +130,6 @@ async function getOrCreateWaClient(userId, deviceId) {
     console.log(`[WA ${userId}/${deviceId}] disconnected (auto-reconnect will handle)`);
   });
 
-  // CRITICAL: session was revoked. Must clear everything so the next
-  // pairing starts clean.
   client.on('logged_out', ({ reason }) => {
     console.warn(`[WA ${userId}/${deviceId}] logged_out reason=${reason} — invalidating session`);
     entry.connected = false;
@@ -151,8 +139,6 @@ async function getOrCreateWaClient(userId, deviceId) {
     waDestroyStore(userId, deviceId).catch(() => {});
   });
 
-  // CRITICAL: protocol-level error. 401/device_removed means the same as
-  // logged_out. Log everything for debugging.
   client.on('stream_error', ({ code }) => {
     console.warn(`[WA ${userId}/${deviceId}] stream_error code=${code}`);
     if (String(code) === '401' || String(code).includes('replaced') || String(code).includes('device_removed')) {
@@ -180,6 +166,26 @@ function waEntryForDevice(userId, deviceId) {
   const knownDevice = waPairedDevice.get(userId);
   if (knownDevice && knownDevice !== deviceId) return null;
   return waClients.get(waCacheKey(userId, deviceId)) || null;
+}
+
+// Helper that waits for the client's WebSocket to actually be ready.
+// This is what the standalone code uses and what makes pairing work.
+function waWaitForConnection(entry, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    if (entry.connected) return resolve(true);
+
+    const timer = setTimeout(() => {
+      entry.client.removeListener('connected', onConnected);
+      reject(new Error('Connection timeout — WhatsApp server did not respond'));
+    }, timeoutMs);
+
+    const onConnected = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+
+    entry.client.once('connected', onConnected);
+  });
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -320,7 +326,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // STRICT DEVICE GUARD: refuse if this user is paired on another device.
       const knownDevice = waPairedDevice.get(userId);
       if (knownDevice && knownDevice !== deviceId) {
         console.log(`[WA ${userId}] blocked: already paired on ${knownDevice}, requested from ${deviceId}`);
@@ -332,7 +337,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Prevent concurrent pairing attempts for the same user.
       if (waPairingInFlight.has(userId)) {
         res.writeHead(429).end(JSON.stringify({
           ok: false,
@@ -346,7 +350,7 @@ const server = http.createServer(async (req, res) => {
       if (cleanPhone.length < 10 || cleanPhone.length > 15) {
         res.writeHead(400).end(JSON.stringify({
           ok: false,
-          error: 'Invalid phone number. Use 10–15 digits with country code.',
+          error: 'Invalid phone number. Use 10-15 digits with country code.',
           code: 'BAD_PHONE',
         }));
         return;
@@ -359,7 +363,7 @@ const server = http.createServer(async (req, res) => {
           return { ok: true, alreadyPaired: true, jid: entry.jid };
         }
 
-        // Step 1: connect. This is async; returns before handshake completes.
+        // Step 1: connect (async, returns before the handshake completes)
         try {
           await entry.client.connect();
         } catch (e) {
@@ -367,46 +371,45 @@ const server = http.createServer(async (req, res) => {
           if (!/already connected/i.test(m)) throw e;
         }
 
-        // Step 2: WAIT for the connection to actually be ready.
-        // pairCode() requires an active connection. Without this wait, we
-        // race the WebSocket handshake and WhatsApp kicks us with 401.
+        // Step 2: WAIT for the connection to be genuinely ready.
+        // Use the helper, not a method on the client.
         try {
-          await entry.client.waitForConnection(15000); // 15s max wait
+          await waWaitForConnection(entry, 15000);
         } catch (e) {
           console.warn(`[WA ${userId}/${deviceId}] waitForConnection failed:`, e.message);
-          // If it timed out but might still connect, proceed cautiously;
-          // pairCode will fail cleanly if not.
+          throw Object.assign(
+            new Error('WhatsApp server did not respond. Try again.'),
+            { code: 'WA_CONNECT_TIMEOUT' }
+          );
         }
 
         // Step 3: request the code.
-        let code;
         try {
-          code = await entry.client.pairCode(cleanPhone);
+          const code = await entry.client.pairCode(cleanPhone);
+          return { ok: true, code };
         } catch (e) {
           const m = String(e?.message || e);
           if (m.includes('conflict') || m.includes('already') || m.includes('401')) {
-            throw Object.assign(new Error('This number is already linked elsewhere. Unlink it first.'), {
-              code: 'PHONE_ALREADY_LINKED',
-            });
+            throw Object.assign(
+              new Error('This number is already linked elsewhere. Unlink it first.'),
+              { code: 'PHONE_ALREADY_LINKED' }
+            );
           }
           throw e;
         }
-
-        return { ok: true, code };
       })();
 
       waPairingInFlight.set(userId, pairingPromise);
 
       try {
         const result = await pairingPromise;
-        if (result.alreadyPaired) {
-          res.end(JSON.stringify(result));
-        } else {
-          res.end(JSON.stringify(result));
-        }
+        res.end(JSON.stringify(result));
       } catch (e) {
         const code = e.code || null;
-        const status = code === 'ALREADY_PAIRED_ELSEWHERE' || code === 'PHONE_ALREADY_LINKED' ? 409 : 500;
+        const status =
+          code === 'ALREADY_PAIRED_ELSEWHERE' || code === 'PHONE_ALREADY_LINKED' ? 409 :
+          code === 'WA_CONNECT_TIMEOUT' ? 504 :
+          500;
         res.writeHead(status).end(JSON.stringify({
           ok: false,
           error: e.message || String(e),
@@ -523,7 +526,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    /* ═══════════════ TELEGRAM ROUTES (unchanged) ═══════════════ */
+    /* ═══════════════ TELEGRAM ROUTES — UNCHANGED ═══════════════ */
 
     // ---- POST /tg/start-login ----
     if (req.method === 'POST' && url.pathname === '/tg/start-login') {
