@@ -110,13 +110,24 @@ async function getOrCreateWaClient(userId, deviceId) {
 
   console.log(`[WA ${userId}/${deviceId}] creating client`);
   const storeUrl = await waStoreUrlForUser(userId, deviceId);
+
+  // Increased commandTimeout to 300000 (5 min). The Go binary opening a
+  // Postgres store + initial sync can take well over 30s on cold starts.
   const client = createClient({
     store: storeUrl,
-    commandTimeout: 120000,
+    commandTimeout: 300000,
   });
 
   const entry = { client, jid: null, connected: false, deviceId, loggedOut: false };
   waClients.set(key, entry);
+
+  // Surface the Go binary's own logs. This is the most useful debugging
+  // channel — it shows what whatsmeow itself is doing.
+  client.on('log', ({ level, msg }) => {
+    if (level === 'error' || level === 'warn' || msg.includes('connect') || msg.includes('store')) {
+      console.log(`[WA ${userId}/${deviceId}][go:${level}] ${msg}`);
+    }
+  });
 
   client.on('connected', ({ jid }) => {
     entry.jid = jid;
@@ -151,11 +162,18 @@ async function getOrCreateWaClient(userId, deviceId) {
     }
   });
 
+  client.on('keep_alive_timeout', ({ errorCount }) => {
+    console.warn(`[WA ${userId}/${deviceId}] keep_alive_timeout errors=${errorCount}`);
+  });
+
   client.on('error', (err) => {
     const m = err?.message || String(err);
     console.error(`[WA ${userId}/${deviceId}] EVENT error:`, m);
     if (err instanceof WhatsmeowError && err.code === 'ERR_TIMEOUT') {
-      console.error(`[WA ${userId}/${deviceId}] command timed out`);
+      console.error(`[WA ${userId}/${deviceId}] IPC command timed out — Go binary is slow or stuck`);
+    }
+    if (err instanceof WhatsmeowError && err.code === 'ERR_PROCESS_EXITED') {
+      console.error(`[WA ${userId}/${deviceId}] Go binary crashed — check platform binary exists`);
     }
   });
 
@@ -172,18 +190,17 @@ function waEntryForDevice(userId, deviceId) {
 }
 
 /**
- * Poll entry.connected instead of relying on the 'connected' event.
- * The event can fire before we attach a listener, or not fire at all on
- * some library versions. Polling the flag is deterministic.
+ * Poll entry.connected. Increased to 120s — WhatsApp handshake + initial
+ * sync can genuinely take this long on a cold Supabase connection.
  */
-async function waWaitForConnection(entry, timeoutMs = 30000) {
+async function waWaitForConnection(entry, timeoutMs = 120000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (entry.connected) {
       console.log(`[WA] connection flag became true after ${Date.now() - start}ms`);
       return true;
     }
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 1000));
   }
   console.warn(`[WA] connection timeout after ${timeoutMs}ms, entry.connected=${entry.connected}`);
   return false;
@@ -366,7 +383,6 @@ const server = http.createServer(async (req, res) => {
           return { ok: true, alreadyPaired: true, jid: entry.jid };
         }
 
-        // Step 1: connect
         console.log(`[WA ${userId}/${deviceId}] pair: calling connect()`);
         try {
           await entry.client.connect();
@@ -380,17 +396,15 @@ const server = http.createServer(async (req, res) => {
           console.log(`[WA ${userId}/${deviceId}] pair: connect() says already connected`);
         }
 
-        // Step 2: wait for connected flag
-        console.log(`[WA ${userId}/${deviceId}] pair: waiting for connected flag`);
-        const ok = await waWaitForConnection(entry, 30000);
+        console.log(`[WA ${userId}/${deviceId}] pair: waiting for connected flag (max 120s)`);
+        const ok = await waWaitForConnection(entry, 120000);
         if (!ok) {
           throw Object.assign(
-            new Error('WhatsApp server did not respond within 30s. Try again.'),
+            new Error('WhatsApp server did not respond within 120s. The Go binary may be stuck opening the Supabase store. Try again.'),
             { code: 'WA_CONNECT_TIMEOUT' }
           );
         }
 
-        // Step 3: pairCode
         console.log(`[WA ${userId}/${deviceId}] pair: calling pairCode(${cleanPhone})`);
         try {
           const code = await entry.client.pairCode(cleanPhone);
@@ -420,7 +434,7 @@ const server = http.createServer(async (req, res) => {
           code === 'ALREADY_PAIRED_ELSEWHERE' || code === 'PHONE_ALREADY_LINKED' ? 409 :
           code === 'WA_CONNECT_TIMEOUT' ? 504 :
           500;
-        console.error(`[WA ${userId}] pair: failed with code=${code} msg=${e.message}`);
+        console.error(`[WA ${userId}] pair: failed code=${code} msg=${e.message}`);
         res.writeHead(status).end(JSON.stringify({
           ok: false,
           error: e.message || String(e),
