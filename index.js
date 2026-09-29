@@ -319,18 +319,33 @@ const server = http.createServer(async (req, res) => {
       try {
         const oggBuf = await fs.readFile(outPath);
         const media = await entry.client.uploadMedia(outPath, 'audio');
-        await entry.client.sendRawMessage(to, {
-          audioMessage: {
-            url: media.URL ?? media.url,
-            directPath: media.directPath,
-            mediaKey: media.mediaKey,
-            fileEncSHA256: media.fileEncSHA256,
-            fileSHA256: media.fileSHA256,
-            fileLength: String(media.fileLength),
-            mimetype: 'audio/ogg; codecs=opus',
-            PTT: true,
-          },
-        });
+        const base = {
+          directPath: media.directPath,
+          mediaKey: media.mediaKey,
+          fileEncSHA256: media.fileEncSHA256,
+          fileSHA256: media.fileSHA256,
+          fileLength: String(media.fileLength),
+          mimetype: 'audio/ogg; codecs=opus',
+        };
+        const mediaUrl = media.URL ?? media.url;
+        // Protobuf JSON names: URL / PTT (uppercase). Fallback to lowercase if this build differs.
+        const variants = [
+          { ...base, URL: mediaUrl, PTT: true },
+          { ...base, url: mediaUrl, ptt: true },
+        ];
+        let lastErr;
+        for (const audioMessage of variants) {
+          try {
+            await entry.client.sendRawMessage(to, { audioMessage });
+            lastErr = null;
+            break;
+          } catch (e) {
+            lastErr = e;
+            if (!/unknown field/i.test(String(e?.message))) break;
+            console.warn(`[${userId}] proto field mismatch, trying next variant: ${e.message}`);
+          }
+        }
+        if (lastErr) throw lastErr;
         return json(res, 200, { ok: true, to, bytes: oggBuf.length });
       } finally {
         await cleanup();
