@@ -1,915 +1,368 @@
-import { createClient, WhatsmeowError } from '@whatsmeow-node/whatsmeow-node';
-import { TelegramClient, Api } from 'telegram';
-import { StringSession } from 'telegram/sessions/index.js';
-import { CustomFile } from 'telegram/client/uploads.js';
-import { computeCheck } from 'telegram/Password.js';
-import { exec } from 'child_process';
+import { createClient } from '@whatsmeow-node/whatsmeow-node';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import http from 'http';
+import crypto from 'crypto';
 import pg from 'pg';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const { Pool } = pg;
 
-// ---- config ----
+// ================= config =================
 const PORT = process.env.PORT || 3000;
-const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
 const APP_BASE_URL = process.env.APP_BASE_URL;
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
-const TG_API_ID = parseInt(process.env.TG_API_ID, 10);
-const TG_API_HASH = process.env.TG_API_HASH;
 
-if (!SUPABASE_DB_URL || !APP_BASE_URL || !BRIDGE_SECRET) {
-  console.error('Missing required env: SUPABASE_DB_URL, APP_BASE_URL, BRIDGE_SECRET');
+// STORE_MODE=sqlite  (default, most reliable; needs a persistent disk at DATA_DIR)
+// STORE_MODE=postgres (needs SUPABASE_DB_URL = DIRECT or SESSION-pooler string, port 5432, NOT 6543)
+const STORE_MODE = (process.env.STORE_MODE || 'sqlite').toLowerCase();
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
+
+const INIT_TIMEOUT = 25000;
+const CONNECT_TIMEOUT = 20000;
+const PAIR_TIMEOUT = 20000;
+
+if (!APP_BASE_URL || !BRIDGE_SECRET) {
+  console.error('Missing required env vars: APP_BASE_URL, BRIDGE_SECRET');
+  process.exit(1);
+}
+if (STORE_MODE === 'postgres' && !SUPABASE_DB_URL) {
+  console.error('STORE_MODE=postgres requires SUPABASE_DB_URL');
   process.exit(1);
 }
 
-const adminPool = new Pool({ connectionString: SUPABASE_DB_URL });
+const adminPool = STORE_MODE === 'postgres'
+  ? new Pool({ connectionString: SUPABASE_DB_URL, connectionTimeoutMillis: 10000 })
+  : null;
 
-/* ═══════════════════════════════════════════════════════════════
-   HELPERS
-   ═══════════════════════════════════════════════════════════════ */
+// ================= helpers =================
+const safeId = (userId) =>
+  String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
 
 function withTimeout(promise, ms, label) {
   let t;
-  const timeout = new Promise((_, rej) =>
-    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms));
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   WHATSAPP STATE (strictly device-based)
-   ═══════════════════════════════════════════════════════════════ */
-
-const waClients = new Map();
-const waPairedDevice = new Map();
-const waPairingInFlight = new Map();
-const waPendingInits = new Map();
-
-function waCacheKey(userId, deviceId) {
-  return `${userId}:${deviceId}`;
+function safeEqual(a, b) {
+  const A = Buffer.from(String(a || ''));
+  const B = Buffer.from(String(b || ''));
+  return A.length === B.length && crypto.timingSafeEqual(A, B);
 }
 
-function waSchemaFor(userId, deviceId) {
-  const u = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24) || 'default';
-  const d = String(deviceId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24) || 'default';
-  return `wa_${u}_${d}`;
-}
+// ================= store =================
+async function storeUrlForUser(userId) {
+  const safe = safeId(userId);
 
-async function waStoreUrlForUser(userId, deviceId) {
-  const schema = waSchemaFor(userId, deviceId);
-  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+  if (STORE_MODE === 'sqlite') {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    return `file:${path.join(DATA_DIR, `wa_${safe}.db`)}?_foreign_keys=on`;
+  }
 
+  const schema = `wa_${safe}`; // whitelisted chars only
+  await withTimeout(adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`), 10000, 'create schema');
   const u = new URL(SUPABASE_DB_URL);
   u.searchParams.set('sslmode', 'require');
   u.searchParams.set('connect_timeout', '10');
-
-  // Toggle with env var. Set WA_USE_SEARCH_PATH=0 on Render to test without it.
-  if (process.env.WA_USE_SEARCH_PATH !== '0') {
-    u.searchParams.set('options', `-csearch_path=${schema}`);
-  }
-
-  console.log(`[WA] store URL: ${u.host}${u.pathname} options=${u.searchParams.get('options') || 'none'}`);
+  u.searchParams.set('options', `-csearch_path=${schema}`);
   return u.toString();
 }
 
-async function waDestroyStore(userId, deviceId) {
-  const schema = waSchemaFor(userId, deviceId);
+// Which users already have a stored session (used to restore after restart)
+async function listStoredUsers() {
   try {
-    await adminPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    console.log(`[WA ${userId}/${deviceId}] dropped schema ${schema}`);
-  } catch (e) {
-    console.error(`[WA ${userId}/${deviceId}] drop schema failed:`, e.message);
-  }
-}
-
-async function waDestroyAllStoresForUser(userId) {
-  const prefix = `wa_${String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24)}_`;
-  try {
-    const res = await adminPool.query(
-      `SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE $1`,
-      [prefix + '%']
+    if (STORE_MODE === 'sqlite') {
+      const files = await fs.readdir(DATA_DIR).catch(() => []);
+      return files
+        .filter((f) => /^wa_.+\.db$/.test(f))
+        .map((f) => f.slice(3, -3));
+    }
+    const r = await adminPool.query(
+      `SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'wa\\_%'`
     );
-    for (const row of res.rows) {
-      await adminPool.query(`DROP SCHEMA IF EXISTS ${row.schema_name} CASCADE`);
-      console.log(`[WA ${userId}] dropped stale schema ${row.schema_name}`);
-    }
+    return r.rows.map((x) => x.schema_name.slice(3));
   } catch (e) {
-    console.error(`[WA ${userId}] destroy-all failed:`, e.message);
+    console.error('listStoredUsers failed:', e.message);
+    return [];
   }
 }
 
-async function waDropClient(userId, deviceId) {
-  const key = waCacheKey(userId, deviceId);
-  const entry = waClients.get(key);
-  if (!entry) return;
-  try {
-    if (entry.client) {
-      try { await entry.client.disconnect(); } catch (e) {}
-      try { if (typeof entry.client.close === 'function') await entry.client.close(); } catch (e) {}
-    }
-  } catch (e) {
-    console.error(`[WA ${key}] client close failed:`, e.message);
-  }
-  waClients.delete(key);
-}
+// ================= client registry =================
+const clients = new Map(); // userId -> entry (only fully initialised clients)
+const pending = new Map(); // userId -> Promise (dedupes concurrent init)
 
-async function getOrCreateWaClient(userId, deviceId) {
-  const key = waCacheKey(userId, deviceId);
-
-  if (waClients.has(key)) return waClients.get(key);
-  if (waPendingInits.has(key)) return waPendingInits.get(key);
+async function getOrCreateClient(userId) {
+  if (clients.has(userId)) return clients.get(userId);
+  if (pending.has(userId)) return pending.get(userId);
 
   const p = (async () => {
-    const knownDevice = waPairedDevice.get(userId);
-    if (knownDevice && knownDevice !== deviceId) {
-      console.log(`[WA ${userId}] device changed ${knownDevice} -> ${deviceId}, invalidating`);
-      await waDropClient(userId, knownDevice);
-      await waDestroyAllStoresForUser(userId);
-      waPairedDevice.delete(userId);
-    }
+    console.log(`[${userId}] preparing store (${STORE_MODE})...`);
+    const storeUrl = await storeUrlForUser(userId);
 
-    console.log(`[WA ${userId}/${deviceId}] creating client`);
-    const storeUrl = await waStoreUrlForUser(userId, deviceId);
-    const client = createClient({ store: storeUrl, commandTimeout: 300000 });
+    const client = createClient({ store: storeUrl, commandTimeout: 30000 });
+    const entry = { client, jid: null, connected: false, pairedAt: null };
 
-    const entry = { client, jid: null, connected: false, deviceId, loggedOut: false };
-
-    client.on('log', ({ level, msg }) => {
-      if (level === 'error' || level === 'warn' || /connect|store|database|dial/i.test(msg)) {
-        console.log(`[WA ${userId}/${deviceId}][go:${level}] ${msg}`);
-      }
-    });
-
-    client.on('connected', ({ jid }) => {
-      entry.jid = jid;
+    client.on('connected', (ev) => {
+      entry.jid = ev?.jid || entry.jid;
       entry.connected = true;
-      entry.loggedOut = false;
-      waPairedDevice.set(userId, deviceId);
-      console.log(`[WA ${userId}/${deviceId}] EVENT connected as ${jid}`);
+      console.log(`[${userId}] CONNECTED jid=${entry.jid}`);
     });
-
     client.on('disconnected', () => {
       entry.connected = false;
-      console.log(`[WA ${userId}/${deviceId}] EVENT disconnected`);
+      console.log(`[${userId}] disconnected`);
     });
-
-    client.on('logged_out', ({ reason }) => {
-      console.warn(`[WA ${userId}/${deviceId}] EVENT logged_out reason=${reason}`);
+    client.on('pair_success', (ev) => {
+      entry.jid = ev?.jid || entry.jid;
+      entry.pairedAt = Date.now();
+      console.log(`[${userId}] PAIR SUCCESS jid=${entry.jid}`);
+    });
+    client.on('logged_out', () => {
       entry.connected = false;
-      entry.loggedOut = true;
-      waPairedDevice.delete(userId);
-      waClients.delete(key);
-      waDestroyStore(userId, deviceId).catch(() => {});
+      entry.jid = null;
+      console.log(`[${userId}] logged out from phone`);
+      clients.delete(userId);
     });
-
-    client.on('stream_error', ({ code }) => {
-      console.warn(`[WA ${userId}/${deviceId}] EVENT stream_error code=${code}`);
-      if (String(code) === '401' || String(code).includes('replaced') || String(code).includes('device_removed')) {
-        entry.connected = false;
-        entry.loggedOut = true;
-        waPairedDevice.delete(userId);
-        waClients.delete(key);
-        waDestroyStore(userId, deviceId).catch(() => {});
-      }
-    });
-
-    client.on('keep_alive_timeout', ({ errorCount }) => {
-      console.warn(`[WA ${userId}/${deviceId}] keep_alive_timeout errors=${errorCount}`);
-    });
-
-    client.on('error', (err) => {
-      const m = err?.message || String(err);
-      console.error(`[WA ${userId}/${deviceId}] EVENT error:`, m);
-      if (err instanceof WhatsmeowError && err.code === 'ERR_TIMEOUT') {
-        console.error(`[WA ${userId}/${deviceId}] IPC command timed out`);
-      }
-      if (err instanceof WhatsmeowError && err.code === 'ERR_PROCESS_EXITED') {
-        console.error(`[WA ${userId}/${deviceId}] Go binary crashed`);
-      }
-    });
+    client.on('error', (err) => console.error(`[${userId}] error:`, err?.message || err));
 
     try {
-      console.log(`[WA ${userId}/${deviceId}] calling init()`);
-      await withTimeout(client.init(), 25000, 'client.init');
-      console.log(`[WA ${userId}/${deviceId}] init() OK`);
+      console.log(`[${userId}] init...`);
+      const info = await withTimeout(client.init(), INIT_TIMEOUT, 'client.init');
+      if (info?.jid) entry.jid = info.jid; // already-paired store returns its jid
+      console.log(`[${userId}] init ok jid=${entry.jid || 'none (unpaired)'}`);
     } catch (e) {
-      console.error(`[WA ${userId}/${deviceId}] init() FAILED: ${e.message}`);
-      try { await client.disconnect(); } catch (_) {}
-      try { if (typeof client.close === 'function') await client.close(); } catch (_) {}
-      throw e;
+      try { await client.close?.(); } catch {}
+      throw e; // never cache a broken client
     }
 
-    waClients.set(key, entry);
+    clients.set(userId, entry);
     return entry;
-  })().finally(() => waPendingInits.delete(key));
+  })().finally(() => pending.delete(userId));
 
-  waPendingInits.set(key, p);
+  pending.set(userId, p);
   return p;
 }
 
-function waEntryForDevice(userId, deviceId) {
-  const knownDevice = waPairedDevice.get(userId);
-  if (knownDevice && knownDevice !== deviceId) return null;
-  return waClients.get(waCacheKey(userId, deviceId)) || null;
-}
-
-async function waWaitForConnection(entry, timeoutMs = 60000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (entry.connected) {
-      console.log(`[WA] connection flag became true after ${Date.now() - start}ms`);
-      return true;
-    }
-    await new Promise(r => setTimeout(r, 1000));
+async function ensureConnected(entry, userId) {
+  if (entry.connected) return;
+  try {
+    await withTimeout(entry.client.connect(), CONNECT_TIMEOUT, 'connect');
+  } catch (e) {
+    if (!/already connected/i.test(String(e?.message))) throw e;
   }
-  console.warn(`[WA] connection timeout after ${timeoutMs}ms, entry.connected=${entry.connected}`);
-  return false;
+  // give the 'connected' event a moment to land
+  for (let i = 0; i < 20 && !entry.connected && entry.jid; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  console.log(`[${userId}] ensureConnected done connected=${entry.connected}`);
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   TELEGRAM STATE (GramJS) — unchanged
-   ═══════════════════════════════════════════════════════════════ */
-
-const tgClients = new Map();
-const tgPendingLogins = new Map();
-
-function tgSchemaFor(userId) {
-  const safe = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
-  return `tg_${safe}`;
-}
-
-async function tgEnsureSchema(userId) {
-  const schema = tgSchemaFor(userId);
-  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
-  await adminPool.query(`
-    CREATE TABLE IF NOT EXISTS ${schema}.sessions (
-      user_id TEXT PRIMARY KEY,
-      session_string TEXT NOT NULL,
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  return schema;
-}
-
-async function tgGetUserSession(userId) {
-  const schema = await tgEnsureSchema(userId);
-  const res = await adminPool.query(
-    `SELECT session_string FROM ${schema}.sessions WHERE user_id = $1`,
-    [userId]
-  );
-  return res.rows[0]?.session_string || '';
-}
-
-async function tgSaveUserSession(userId, sessionString) {
-  const schema = await tgEnsureSchema(userId);
-  await adminPool.query(
-    `INSERT INTO ${schema}.sessions (user_id, session_string, updated_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (user_id) DO UPDATE SET session_string = $2, updated_at = NOW()`,
-    [userId, sessionString]
-  );
-}
-
-async function getOrCreateTgClient(userId) {
-  if (tgClients.has(userId)) return tgClients.get(userId);
-
-  const sessionString = await tgGetUserSession(userId);
-  const session = new StringSession(sessionString);
-
-  const client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
-    connectionRetries: 5,
-    useWSS: false,
-  });
-
-  const entry = { client, connected: false };
-  tgClients.set(userId, entry);
-
-  if (sessionString) {
+// Restore every previously-paired user on boot so /status and /send survive restarts
+async function restoreSessions() {
+  const users = await listStoredUsers();
+  console.log(`restoring ${users.length} stored session(s)`);
+  for (const userId of users) {
     try {
-      await client.connect();
-      const me = await client.getMe();
-      if (me) {
-        entry.connected = true;
-        console.log(`[TG ${userId}] reconnected from saved session`);
-      } else {
-        throw new Error('Session present but not authorized');
-      }
+      const entry = await getOrCreateClient(userId);
+      if (entry.jid) await ensureConnected(entry, userId);
     } catch (e) {
-      console.error(`[TG ${userId}] reconnect failed:`, e.message);
-      tgClients.delete(userId);
-      throw new Error('Saved session is invalid — please log in again.');
+      console.error(`[${userId}] restore failed:`, e.message);
     }
   }
-
-  return entry;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   MULTIPART HELPER
-   ═══════════════════════════════════════════════════════════════ */
-
-function splitMultipart(buf, boundary) {
-  const delim = Buffer.from('\r\n' + boundary);
-  const parts = [];
-  let start = 0;
-  while (true) {
-    const idx = buf.indexOf(delim, start);
-    if (idx === -1) {
-      parts.push(buf.slice(start));
-      break;
-    }
-    if (idx > start) parts.push(buf.slice(start, idx));
-    start = idx + delim.length;
+// ================= audio =================
+async function toOggOpus(wavBuf) {
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const inPath = path.join(os.tmpdir(), `wa-${stamp}.in`);
+  const outPath = path.join(os.tmpdir(), `wa-${stamp}.ogg`);
+  await fs.writeFile(inPath, wavBuf);
+  try {
+    await execFileAsync('ffmpeg', [
+      '-y', '-i', inPath, '-vn',
+      '-c:a', 'libopus', '-b:a', '32k', '-ar', '16000', '-ac', '1',
+      '-application', 'voip', '-avoid_negative_ts', 'make_zero', '-map_metadata', '-1',
+      outPath,
+    ], { timeout: 30000 });
+    return { outPath, cleanup: async () => { await fs.unlink(inPath).catch(() => {}); await fs.unlink(outPath).catch(() => {}); } };
+  } catch (e) {
+    await fs.unlink(inPath).catch(() => {});
+    await fs.unlink(outPath).catch(() => {});
+    throw e;
   }
-  return parts;
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   SERVER
-   ═══════════════════════════════════════════════════════════════ */
+// ================= server =================
+const json = (res, code, body) => {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+};
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Secret');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204).end();
-    return;
-  }
-
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  const rawBodyBuffer = Buffer.concat(chunks);
-  const raw = rawBodyBuffer.toString('utf8');
-
-  res.setHeader('Content-Type', 'application/json');
-
-  const providedSecret = req.headers['x-bridge-secret'];
-  if (providedSecret !== BRIDGE_SECRET) {
-    res.writeHead(401).end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
+  if (req.method === 'GET' && url.pathname === '/health') {
+    return json(res, 200, { ok: true, clients: clients.size });
+  }
+
+  if (!safeEqual(req.headers['x-bridge-secret'], BRIDGE_SECRET)) {
+    return json(res, 401, { ok: false, error: 'Unauthorized' });
+  }
+
+  let raw = '';
   try {
-    /* ═══════════════ WHATSAPP ROUTES ═══════════════ */
+    const chunks = [];
+    let size = 0;
+    for await (const c of req) {
+      size += c.length;
+      if (size > 1_000_000) return json(res, 413, { ok: false, error: 'Body too large' });
+      chunks.push(c);
+    }
+    raw = Buffer.concat(chunks).toString('utf8');
+  } catch (e) {
+    return json(res, 400, { ok: false, error: 'Bad body' });
+  }
 
-    // ---- POST /pair ----
+  try {
+    // ---------- POST /pair ----------
     if (req.method === 'POST' && url.pathname === '/pair') {
-      const { userId, deviceId, phone } = JSON.parse(raw || '{}');
-      if (!userId || !deviceId || !phone) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId, deviceId, phone required' }));
-        return;
-      }
-
-      const knownDevice = waPairedDevice.get(userId);
-      if (knownDevice && knownDevice !== deviceId) {
-        console.log(`[WA ${userId}] blocked: already paired on ${knownDevice}, requested from ${deviceId}`);
-        res.writeHead(409).end(JSON.stringify({
-          ok: false,
-          error: 'This number is already linked to another device. Unlink it there first.',
-          code: 'ALREADY_PAIRED_ELSEWHERE',
-        }));
-        return;
-      }
-
-      if (waPairingInFlight.has(userId)) {
-        res.writeHead(429).end(JSON.stringify({
-          ok: false,
-          error: 'Pairing already in progress for this account. Wait a moment.',
-          code: 'PAIRING_IN_FLIGHT',
-        }));
-        return;
-      }
+      const { userId, phone } = JSON.parse(raw || '{}');
+      if (!userId || !phone) return json(res, 400, { ok: false, error: 'userId and phone required' });
 
       const cleanPhone = String(phone).replace(/[^0-9]/g, '');
-      if (cleanPhone.length < 10 || cleanPhone.length > 15) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'Invalid phone number. Use 10-15 digits with country code.',
-          code: 'BAD_PHONE',
-        }));
-        return;
-      }
+      if (cleanPhone.length < 8) return json(res, 400, { ok: false, error: 'Phone must include country code, digits only' });
 
-      const pairingPromise = (async () => {
-        const t0 = Date.now();
-        const log = (m) => console.log(`[pair ${userId}] +${Date.now() - t0}ms ${m}`);
+      const t0 = Date.now();
+      const log = (m) => console.log(`[pair ${userId}] +${Date.now() - t0}ms ${m}`);
 
-        log('getOrCreateClient...');
-        const entry = await getOrCreateWaClient(userId, deviceId);
-        log('store opened');
+      log('getOrCreateClient...');
+      const entry = await getOrCreateClient(userId);
+      log('store opened');
 
+      // Already logged in on a previous run
+      if (entry.jid) {
+        await ensureConnected(entry, userId);
         if (entry.connected) {
-          log('already connected');
-          return { ok: true, alreadyPaired: true, jid: entry.jid };
+          log('already paired');
+          return json(res, 200, { ok: true, alreadyPaired: true, jid: entry.jid });
         }
-
-        log('calling connect()');
-        await withTimeout(entry.client.connect(), 20000, 'connect').catch(e => {
-          if (!/already connected/i.test(String(e?.message))) throw e;
-        });
-        log('websocket connected');
-
-        log('waiting for connected flag');
-        const ok = await waWaitForConnection(entry, 60000);
-        if (!ok) {
-          throw Object.assign(
-            new Error('WhatsApp handshake did not complete within 60s. Check the Go binary logs.'),
-            { code: 'WA_CONNECT_TIMEOUT' }
-          );
-        }
-        log('flag true');
-
-        log(`calling pairCode(${cleanPhone})`);
-        try {
-          const code = await withTimeout(entry.client.pairCode(cleanPhone), 20000, 'pairCode');
-          log('got code');
-          return { ok: true, code };
-        } catch (e) {
-          const m = String(e?.message || e);
-          log(`pairCode threw: ${m}`);
-          if (m.includes('conflict') || m.includes('already') || m.includes('401')) {
-            throw Object.assign(
-              new Error('This number is already linked elsewhere. Unlink it first.'),
-              { code: 'PHONE_ALREADY_LINKED' }
-            );
-          }
-          throw e;
-        }
-      })();
-
-      waPairingInFlight.set(userId, pairingPromise);
+      }
 
       try {
-        const result = await pairingPromise;
-        res.end(JSON.stringify(result));
+        await withTimeout(entry.client.connect(), CONNECT_TIMEOUT, 'connect');
       } catch (e) {
-        const code = e.code || null;
-        const status =
-          code === 'ALREADY_PAIRED_ELSEWHERE' || code === 'PHONE_ALREADY_LINKED' ? 409 :
-          code === 'WA_CONNECT_TIMEOUT' ? 504 :
-          500;
-        console.error(`[WA ${userId}] pair failed code=${code} msg=${e.message}`);
-        res.writeHead(status).end(JSON.stringify({
-          ok: false,
-          error: e.message || String(e),
-          code,
-        }));
-      } finally {
-        waPairingInFlight.delete(userId);
+        if (!/already connected/i.test(String(e?.message))) throw e;
       }
-      return;
+      log('websocket connected');
+
+      const code = await withTimeout(entry.client.pairCode(cleanPhone), PAIR_TIMEOUT, 'pairCode');
+      log(`got code ${code}`);
+      return json(res, 200, { ok: true, code });
     }
 
-    // ---- GET /status ----
+    // ---------- GET /status ----------
     if (req.method === 'GET' && url.pathname === '/status') {
       const userId = url.searchParams.get('userId');
-      const deviceId = url.searchParams.get('deviceId');
-      if (!userId || !deviceId) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and deviceId required' }));
-        return;
+      if (!userId) return json(res, 400, { ok: false, error: 'userId required' });
+
+      let entry = clients.get(userId);
+      if (!entry) {
+        // After a restart: only revive users that actually have a stored session
+        const stored = await listStoredUsers();
+        if (stored.includes(safeId(userId))) {
+          entry = await getOrCreateClient(userId).catch(() => null);
+          if (entry?.jid && !entry.connected) await ensureConnected(entry, userId).catch(() => {});
+        }
+      } else if (entry.jid && !entry.connected) {
+        await ensureConnected(entry, userId).catch(() => {});
       }
-      const entry = waEntryForDevice(userId, deviceId);
-      res.end(JSON.stringify({
+
+      return json(res, 200, {
         ok: true,
         connected: !!entry?.connected,
+        paired: !!entry?.jid,
         jid: entry?.jid || null,
-        loggedOut: !!entry?.loggedOut,
-      }));
-      return;
+      });
     }
 
-    // ---- POST /unpair ----
-    if (req.method === 'POST' && url.pathname === '/unpair') {
-      const { userId, deviceId } = JSON.parse(raw || '{}');
-      if (!userId || !deviceId) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and deviceId required' }));
-        return;
-      }
-      await waDropClient(userId, deviceId);
-      await waDestroyStore(userId, deviceId);
-      if (waPairedDevice.get(userId) === deviceId) {
-        waPairedDevice.delete(userId);
-      }
-      res.end(JSON.stringify({ ok: true, message: 'Unpaired.' }));
-      return;
-    }
-
-    // ---- POST /send ---- (WhatsApp voice note)
+    // ---------- POST /send ----------
     if (req.method === 'POST' && url.pathname === '/send') {
-      const { userId, deviceId, phone, resultId } = JSON.parse(raw || '{}');
-      if (!userId || !deviceId || !phone || !resultId) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId, deviceId, phone, resultId required',
-        }));
-        return;
+      const { userId, phone, resultId } = JSON.parse(raw || '{}');
+      if (!userId || !phone || !resultId) {
+        return json(res, 400, { ok: false, error: 'userId, phone, resultId required' });
       }
 
-      const entry = waEntryForDevice(userId, deviceId);
-      if (!entry?.connected) {
-        res.writeHead(409).end(JSON.stringify({
-          ok: false,
-          error: 'Not paired on this device',
-        }));
-        return;
-      }
+      let entry = clients.get(userId) || (await getOrCreateClient(userId));
+      if (!entry.jid) return json(res, 409, { ok: false, error: 'User not paired' });
+      await ensureConnected(entry, userId);
+      if (!entry.connected) return json(res, 409, { ok: false, error: 'WhatsApp not connected yet, retry shortly' });
 
       const to = String(phone).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
 
       const audioRes = await fetch(`${APP_BASE_URL}/api/result/${encodeURIComponent(resultId)}`);
-      if (!audioRes.ok) {
-        res.writeHead(502).end(JSON.stringify({
-          ok: false,
-          error: `Audio fetch failed: ${audioRes.status}`,
-        }));
-        return;
-      }
+      if (!audioRes.ok) return json(res, 502, { ok: false, error: `Audio fetch failed: ${audioRes.status}` });
       const inputBuf = Buffer.from(await audioRes.arrayBuffer());
 
-      const tmpDir = os.tmpdir();
-      const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const inPath  = path.join(tmpDir, `wa-in-${stamp}.wav`);
-      const outPath = path.join(tmpDir, `wa-out-${stamp}.ogg`);
-
-      await fs.writeFile(inPath, inputBuf);
-
+      const { outPath, cleanup } = await toOggOpus(inputBuf);
       try {
-        await execAsync(
-          `ffmpeg -y -i "${inPath}" ` +
-          `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
-          `-application voip -avoid_negative_ts make_zero -map_metadata -1 ` +
-          `"${outPath}"`,
-          { timeout: 30000 }
-        );
-
         const oggBuf = await fs.readFile(outPath);
         const media = await entry.client.uploadMedia(outPath, 'audio');
         await entry.client.sendRawMessage(to, {
           audioMessage: {
-            URL: media.URL,
+            url: media.URL ?? media.url,
             directPath: media.directPath,
             mediaKey: media.mediaKey,
             fileEncSHA256: media.fileEncSHA256,
             fileSHA256: media.fileSHA256,
             fileLength: String(media.fileLength),
             mimetype: 'audio/ogg; codecs=opus',
-            PTT: true,
-          }
+            ptt: true,
+          },
         });
-
-        res.end(JSON.stringify({ ok: true, to, bytes: oggBuf.length }));
+        return json(res, 200, { ok: true, to, bytes: oggBuf.length });
       } finally {
-        await fs.unlink(inPath).catch(() => {});
-        await fs.unlink(outPath).catch(() => {});
+        await cleanup();
       }
-      return;
     }
 
-    /* ═══════════════ TELEGRAM ROUTES — UNCHANGED ═══════════════ */
-
-    // ---- POST /tg/start-login ----
-    if (req.method === 'POST' && url.pathname === '/tg/start-login') {
-      const { userId, phone } = JSON.parse(raw || '{}');
-      if (!userId || !phone) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId and phone required',
-        }));
-        return;
+    // ---------- POST /logout ----------
+    if (req.method === 'POST' && url.pathname === '/logout') {
+      const { userId } = JSON.parse(raw || '{}');
+      const entry = clients.get(userId);
+      if (entry) {
+        try { await entry.client.logout?.(); } catch {}
+        try { await entry.client.close?.(); } catch {}
+        clients.delete(userId);
       }
-
-      const cleanPhone = String(phone).replace(/[^0-9+]/g, '');
-
-      const old = tgPendingLogins.get(userId);
-      if (old?.client) {
-        try { await old.client.disconnect(); } catch (e) {}
-      }
-
-      const session = new StringSession('');
-      const client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
-        connectionRetries: 5,
-        useWSS: false,
-      });
-
-      await client.connect();
-
-      const result = await client.invoke(new Api.auth.SendCode({
-        phoneNumber: cleanPhone,
-        apiId: TG_API_ID,
-        apiHash: TG_API_HASH,
-        settings: new Api.CodeSettings({}),
-      }));
-
-      tgPendingLogins.set(userId, {
-        client,
-        phone: cleanPhone,
-        phoneCodeHash: result.phoneCodeHash,
-      });
-
-      res.end(JSON.stringify({
-        ok: true,
-        message: 'Code sent. Check your Telegram app.',
-      }));
-      return;
+      return json(res, 200, { ok: true });
     }
 
-    // ---- POST /tg/verify ----
-    if (req.method === 'POST' && url.pathname === '/tg/verify') {
-      const { userId, code } = JSON.parse(raw || '{}');
-      if (!userId || !code) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId and code required',
-        }));
-        return;
-      }
-
-      const pending = tgPendingLogins.get(userId);
-      if (!pending) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'No pending login. Start over.',
-        }));
-        return;
-      }
-
-      try {
-        await pending.client.invoke(new Api.auth.SignIn({
-          phoneNumber: pending.phone,
-          phoneCodeHash: pending.phoneCodeHash,
-          phoneCode: String(code),
-        }));
-
-        const sessionString = pending.client.session.save();
-        await tgSaveUserSession(userId, sessionString);
-
-        tgClients.set(userId, { client: pending.client, connected: true });
-        tgPendingLogins.delete(userId);
-
-        res.end(JSON.stringify({ ok: true, message: 'Logged in successfully.' }));
-      } catch (err) {
-        const m = err?.errorMessage || err?.message || String(err);
-        if (m.includes('SESSION_PASSWORD_NEEDED')) {
-          res.end(JSON.stringify({
-            ok: true,
-            passwordNeeded: true,
-            message: '2FA password required.',
-          }));
-        } else if (m.includes('PHONE_CODE_INVALID')) {
-          res.writeHead(400).end(JSON.stringify({
-            ok: false,
-            error: 'Invalid code. Try again.',
-          }));
-        } else if (m.includes('PHONE_CODE_EXPIRED')) {
-          res.writeHead(400).end(JSON.stringify({
-            ok: false,
-            error: 'Code expired. Start over.',
-          }));
-        } else {
-          res.writeHead(500).end(JSON.stringify({ ok: false, error: m }));
-        }
-      }
-      return;
-    }
-
-    // ---- POST /tg/verify-password ----
-    if (req.method === 'POST' && url.pathname === '/tg/verify-password') {
-      const { userId, password } = JSON.parse(raw || '{}');
-      if (!userId || !password) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId and password required',
-        }));
-        return;
-      }
-
-      const pending = tgPendingLogins.get(userId);
-      if (!pending) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'No pending login. Start over.',
-        }));
-        return;
-      }
-
-      try {
-        const pwd = await pending.client.invoke(new Api.account.GetPassword());
-        const check = await computeCheck(pwd, password);
-        await pending.client.invoke(new Api.auth.CheckPassword({ password: check }));
-
-        const sessionString = pending.client.session.save();
-        await tgSaveUserSession(userId, sessionString);
-        tgClients.set(userId, { client: pending.client, connected: true });
-        tgPendingLogins.delete(userId);
-
-        res.end(JSON.stringify({ ok: true, message: 'Logged in successfully.' }));
-      } catch (err) {
-        const m = err?.errorMessage || err?.message || String(err);
-        if (m.includes('PASSWORD_HASH_INVALID')) {
-          res.writeHead(400).end(JSON.stringify({
-            ok: false,
-            error: 'Wrong password.',
-          }));
-        } else {
-          res.writeHead(400).end(JSON.stringify({ ok: false, error: m }));
-        }
-      }
-      return;
-    }
-
-    // ---- GET /tg/status ----
-    if (req.method === 'GET' && url.pathname === '/tg/status') {
-      const userId = url.searchParams.get('userId');
-      if (!userId) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId required',
-        }));
-        return;
-      }
-      const entry = tgClients.get(userId);
-      let hasSaved = false;
-      try { hasSaved = !!(await tgGetUserSession(userId)); } catch (e) {}
-      res.end(JSON.stringify({
-        ok: true,
-        connected: !!entry?.connected,
-        hasSavedSession: hasSaved,
-      }));
-      return;
-    }
-
-    // ---- POST /tg/send ----
-    if (req.method === 'POST' && url.pathname === '/tg/send') {
-      const { userId, to, resultId, mode } = JSON.parse(raw || '{}');
-      if (!userId || !to || !resultId) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId, to, resultId required',
-        }));
-        return;
-      }
-
-      const entry = tgClients.get(userId);
-      if (!entry?.connected) {
-        res.writeHead(409).end(JSON.stringify({
-          ok: false,
-          error: 'Not logged in. Please log in first.',
-        }));
-        return;
-      }
-
-      const audioRes = await fetch(`${APP_BASE_URL}/api/result/${encodeURIComponent(resultId)}`);
-      if (!audioRes.ok) {
-        res.writeHead(502).end(JSON.stringify({
-          ok: false,
-          error: `Audio fetch failed: ${audioRes.status}`,
-        }));
-        return;
-      }
-      const inputBuf = Buffer.from(await audioRes.arrayBuffer());
-
-      const tmpDir = os.tmpdir();
-      const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const inPath  = path.join(tmpDir, `tg-in-${stamp}.wav`);
-      const outPath = path.join(tmpDir, `tg-out-${stamp}.ogg`);
-
-      await fs.writeFile(inPath, inputBuf);
-
-      try {
-        await execAsync(
-          `ffmpeg -y -i "${inPath}" ` +
-          `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
-          `-application voip -avoid_negative_ts make_zero -map_metadata -1 ` +
-          `"${outPath}"`,
-          { timeout: 30000 }
-        );
-
-        const entity = await entry.client.getEntity(to);
-
-        const stat = await fs.stat(outPath);
-        const file = new CustomFile(path.basename(outPath), stat.size, outPath);
-        const media = await entry.client.uploadFile({ file, workers: 1 });
-
-        await entry.client.sendFile(entity, {
-          file: media,
-          voiceNote: mode !== 'video',
-          videoNote: mode === 'video',
-        });
-
-        res.end(JSON.stringify({ ok: true, to, mode: mode || 'voice' }));
-      } finally {
-        await fs.unlink(inPath).catch(() => {});
-        await fs.unlink(outPath).catch(() => {});
-      }
-      return;
-    }
-
-    // ---- POST /tg/send-video ----
-    if (req.method === 'POST' && url.pathname === '/tg/send-video') {
-      const contentType = req.headers['content-type'] || '';
-      const boundaryMatch = contentType.match(/boundary=(.+)$/);
-      if (!boundaryMatch) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'multipart/form-data required',
-        }));
-        return;
-      }
-
-      const boundary = '--' + boundaryMatch[1];
-      const parts = splitMultipart(rawBodyBuffer, boundary);
-
-      let videoBuf = null, videoName = 'video.mp4';
-      let formUserId = null, formTo = null;
-
-      for (const part of parts) {
-        const headerEnd = part.indexOf('\r\n\r\n');
-        if (headerEnd === -1) continue;
-        const headers = part.slice(0, headerEnd).toString();
-        const body = part.slice(headerEnd + 4);
-        const nameMatch = headers.match(/name="([^"]+)"/);
-        const fileMatch = headers.match(/filename="([^"]+)"/);
-        if (!nameMatch) continue;
-        const fieldName = nameMatch[1];
-        if (fieldName === 'video' && fileMatch) {
-          videoBuf = body;
-          videoName = fileMatch[1];
-        } else if (fieldName === 'userId') {
-          formUserId = body.toString().trim();
-        } else if (fieldName === 'to') {
-          formTo = body.toString().trim();
-        }
-      }
-
-      if (!videoBuf || !formUserId || !formTo) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'video, userId, to required',
-        }));
-        return;
-      }
-
-      const entry = tgClients.get(formUserId);
-      if (!entry?.connected) {
-        res.writeHead(409).end(JSON.stringify({
-          ok: false,
-          error: 'Not logged in.',
-        }));
-        return;
-      }
-
-      const tmpDir = os.tmpdir();
-      const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const ext = path.extname(videoName) || '.mp4';
-      const inPath  = path.join(tmpDir, `tgvid-in-${stamp}${ext}`);
-      const outPath = path.join(tmpDir, `tgvid-out-${stamp}.mp4`);
-
-      await fs.writeFile(inPath, videoBuf);
-
-      try {
-        await execAsync(
-          `ffmpeg -y -i "${inPath}" ` +
-          `-t 60 ` +
-          `-vf "scale=480:480:force_original_aspect_ratio=increase,crop=480:480" ` +
-          `-c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p ` +
-          `-c:a aac -b:a 64k ` +
-          `-movflags +faststart ` +
-          `"${outPath}"`,
-          { timeout: 180000 }
-        );
-
-        const entity = await entry.client.getEntity(formTo);
-
-        const stat = await fs.stat(outPath);
-        const file = new CustomFile(path.basename(outPath), stat.size, outPath);
-        const media = await entry.client.uploadFile({ file, workers: 1 });
-
-        await entry.client.sendFile(entity, { file: media, videoNote: true });
-
-        res.end(JSON.stringify({ ok: true, to: formTo, bytes: stat.size }));
-      } finally {
-        await fs.unlink(inPath).catch(() => {});
-        await fs.unlink(outPath).catch(() => {});
-      }
-      return;
-    }
-
-    res.writeHead(404).end(JSON.stringify({ ok: false, error: 'not found' }));
+    return json(res, 404, { ok: false, error: 'not found' });
   } catch (err) {
     console.error('request failed:', err);
-    res.writeHead(500).end(JSON.stringify({
-      ok: false,
-      error: err?.message || String(err),
-    }));
+    return json(res, 500, { ok: false, error: err?.message || String(err) });
   }
 });
 
-server.listen(PORT, () => console.log(`Combined bridge on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`WA bridge on :${PORT} (store=${STORE_MODE})`);
+  restoreSessions().catch((e) => console.error('restoreSessions error:', e));
+});
+
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
+process.on('SIGTERM', async () => {
+  for (const { client } of clients.values()) { try { await client.close?.(); } catch {} }
+  process.exit(0);
+});
