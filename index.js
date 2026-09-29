@@ -1,4 +1,8 @@
-import { createClient } from '@whatsmeow-node/whatsmeow-node';
+import { createClient, WhatsmeowError } from '@whatsmeow-node/whatsmeow-node';
+import { TelegramClient, Api } from 'telegram';
+import { StringSession } from 'telegram/sessions/index.js';
+import { CustomFile } from 'telegram/client/uploads.js';
+import { computeCheck } from 'telegram/Password.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
@@ -15,71 +19,324 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
 const APP_BASE_URL = process.env.APP_BASE_URL;
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
+const TG_API_ID = parseInt(process.env.TG_API_ID, 10);
+const TG_API_HASH = process.env.TG_API_HASH;
 
 if (!SUPABASE_DB_URL || !APP_BASE_URL || !BRIDGE_SECRET) {
-  console.error('Missing required environment variables: SUPABASE_DB_URL, APP_BASE_URL, BRIDGE_SECRET');
+  console.error('Missing required env: SUPABASE_DB_URL, APP_BASE_URL, BRIDGE_SECRET');
   process.exit(1);
 }
 
-// A single pool for creating per-user schemas.
 const adminPool = new Pool({ connectionString: SUPABASE_DB_URL });
 
-// One whatsmeow client per user, keyed by userId.
-const clients = new Map();
+/* ═══════════════════════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════════════════════ */
 
-async function storeUrlForUser(userId) {
-  // Sanitize userId into a valid Postgres schema name.
-  const safe = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
-  const schema = `wa_${safe}`;
-  // Whitelisted characters, so no SQL injection path here.
-  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
-  const sep = SUPABASE_DB_URL.includes('?') ? '&' : '?';
-  return `${SUPABASE_DB_URL}${sep}options=-csearch_path%3D${schema}`;
+function withTimeout(promise, ms, label) {
+  let t;
+  const timeout = new Promise((_, rej) =>
+    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms));
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
 
-async function getOrCreateClient(userId) {
-  if (clients.has(userId)) return clients.get(userId);
+/* ═══════════════════════════════════════════════════════════════
+   WHATSAPP STATE (strictly device-based)
+   ═══════════════════════════════════════════════════════════════ */
 
-  const storeUrl = await storeUrlForUser(userId);
-  const client = createClient({ 
-  store: storeUrl,
-  commandTimeout: 120000  // 120 seconds (2 minutes)
-});
+const waClients = new Map();
+const waPairedDevice = new Map();
+const waPairingInFlight = new Map();
+const waPendingInits = new Map();
 
-  const entry = { client, jid: null, connected: false };
-  clients.set(userId, entry);
+function waCacheKey(userId, deviceId) {
+  return `${userId}:${deviceId}`;
+}
 
-  client.on('connected', ({ jid }) => {
-    entry.jid = jid;
-    entry.connected = true;
-    console.log(`[${userId}] connected as ${jid}`);
+function waSchemaFor(userId, deviceId) {
+  const u = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24) || 'default';
+  const d = String(deviceId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24) || 'default';
+  return `wa_${u}_${d}`;
+}
+
+async function waStoreUrlForUser(userId, deviceId) {
+  const schema = waSchemaFor(userId, deviceId);
+  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+
+  const u = new URL(SUPABASE_DB_URL);
+  u.searchParams.set('sslmode', 'require');
+  u.searchParams.set('connect_timeout', '10');
+
+  // Toggle with env var. Set WA_USE_SEARCH_PATH=0 on Render to test without it.
+  if (process.env.WA_USE_SEARCH_PATH !== '0') {
+    u.searchParams.set('options', `-csearch_path=${schema}`);
+  }
+
+  console.log(`[WA] store URL: ${u.host}${u.pathname} options=${u.searchParams.get('options') || 'none'}`);
+  return u.toString();
+}
+
+async function waDestroyStore(userId, deviceId) {
+  const schema = waSchemaFor(userId, deviceId);
+  try {
+    await adminPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    console.log(`[WA ${userId}/${deviceId}] dropped schema ${schema}`);
+  } catch (e) {
+    console.error(`[WA ${userId}/${deviceId}] drop schema failed:`, e.message);
+  }
+}
+
+async function waDestroyAllStoresForUser(userId) {
+  const prefix = `wa_${String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24)}_`;
+  try {
+    const res = await adminPool.query(
+      `SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE $1`,
+      [prefix + '%']
+    );
+    for (const row of res.rows) {
+      await adminPool.query(`DROP SCHEMA IF EXISTS ${row.schema_name} CASCADE`);
+      console.log(`[WA ${userId}] dropped stale schema ${row.schema_name}`);
+    }
+  } catch (e) {
+    console.error(`[WA ${userId}] destroy-all failed:`, e.message);
+  }
+}
+
+async function waDropClient(userId, deviceId) {
+  const key = waCacheKey(userId, deviceId);
+  const entry = waClients.get(key);
+  if (!entry) return;
+  try {
+    if (entry.client) {
+      try { await entry.client.disconnect(); } catch (e) {}
+      try { if (typeof entry.client.close === 'function') await entry.client.close(); } catch (e) {}
+    }
+  } catch (e) {
+    console.error(`[WA ${key}] client close failed:`, e.message);
+  }
+  waClients.delete(key);
+}
+
+async function getOrCreateWaClient(userId, deviceId) {
+  const key = waCacheKey(userId, deviceId);
+
+  if (waClients.has(key)) return waClients.get(key);
+  if (waPendingInits.has(key)) return waPendingInits.get(key);
+
+  const p = (async () => {
+    const knownDevice = waPairedDevice.get(userId);
+    if (knownDevice && knownDevice !== deviceId) {
+      console.log(`[WA ${userId}] device changed ${knownDevice} -> ${deviceId}, invalidating`);
+      await waDropClient(userId, knownDevice);
+      await waDestroyAllStoresForUser(userId);
+      waPairedDevice.delete(userId);
+    }
+
+    console.log(`[WA ${userId}/${deviceId}] creating client`);
+    const storeUrl = await waStoreUrlForUser(userId, deviceId);
+    const client = createClient({ store: storeUrl, commandTimeout: 300000 });
+
+    const entry = { client, jid: null, connected: false, deviceId, loggedOut: false };
+
+    client.on('log', ({ level, msg }) => {
+      if (level === 'error' || level === 'warn' || /connect|store|database|dial/i.test(msg)) {
+        console.log(`[WA ${userId}/${deviceId}][go:${level}] ${msg}`);
+      }
+    });
+
+    client.on('connected', ({ jid }) => {
+      entry.jid = jid;
+      entry.connected = true;
+      entry.loggedOut = false;
+      waPairedDevice.set(userId, deviceId);
+      console.log(`[WA ${userId}/${deviceId}] EVENT connected as ${jid}`);
+    });
+
+    client.on('disconnected', () => {
+      entry.connected = false;
+      console.log(`[WA ${userId}/${deviceId}] EVENT disconnected`);
+    });
+
+    client.on('logged_out', ({ reason }) => {
+      console.warn(`[WA ${userId}/${deviceId}] EVENT logged_out reason=${reason}`);
+      entry.connected = false;
+      entry.loggedOut = true;
+      waPairedDevice.delete(userId);
+      waClients.delete(key);
+      waDestroyStore(userId, deviceId).catch(() => {});
+    });
+
+    client.on('stream_error', ({ code }) => {
+      console.warn(`[WA ${userId}/${deviceId}] EVENT stream_error code=${code}`);
+      if (String(code) === '401' || String(code).includes('replaced') || String(code).includes('device_removed')) {
+        entry.connected = false;
+        entry.loggedOut = true;
+        waPairedDevice.delete(userId);
+        waClients.delete(key);
+        waDestroyStore(userId, deviceId).catch(() => {});
+      }
+    });
+
+    client.on('keep_alive_timeout', ({ errorCount }) => {
+      console.warn(`[WA ${userId}/${deviceId}] keep_alive_timeout errors=${errorCount}`);
+    });
+
+    client.on('error', (err) => {
+      const m = err?.message || String(err);
+      console.error(`[WA ${userId}/${deviceId}] EVENT error:`, m);
+      if (err instanceof WhatsmeowError && err.code === 'ERR_TIMEOUT') {
+        console.error(`[WA ${userId}/${deviceId}] IPC command timed out`);
+      }
+      if (err instanceof WhatsmeowError && err.code === 'ERR_PROCESS_EXITED') {
+        console.error(`[WA ${userId}/${deviceId}] Go binary crashed`);
+      }
+    });
+
+    try {
+      console.log(`[WA ${userId}/${deviceId}] calling init()`);
+      await withTimeout(client.init(), 25000, 'client.init');
+      console.log(`[WA ${userId}/${deviceId}] init() OK`);
+    } catch (e) {
+      console.error(`[WA ${userId}/${deviceId}] init() FAILED: ${e.message}`);
+      try { await client.disconnect(); } catch (_) {}
+      try { if (typeof client.close === 'function') await client.close(); } catch (_) {}
+      throw e;
+    }
+
+    waClients.set(key, entry);
+    return entry;
+  })().finally(() => waPendingInits.delete(key));
+
+  waPendingInits.set(key, p);
+  return p;
+}
+
+function waEntryForDevice(userId, deviceId) {
+  const knownDevice = waPairedDevice.get(userId);
+  if (knownDevice && knownDevice !== deviceId) return null;
+  return waClients.get(waCacheKey(userId, deviceId)) || null;
+}
+
+async function waWaitForConnection(entry, timeoutMs = 60000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (entry.connected) {
+      console.log(`[WA] connection flag became true after ${Date.now() - start}ms`);
+      return true;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  console.warn(`[WA] connection timeout after ${timeoutMs}ms, entry.connected=${entry.connected}`);
+  return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TELEGRAM STATE (GramJS) — unchanged
+   ═══════════════════════════════════════════════════════════════ */
+
+const tgClients = new Map();
+const tgPendingLogins = new Map();
+
+function tgSchemaFor(userId) {
+  const safe = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
+  return `tg_${safe}`;
+}
+
+async function tgEnsureSchema(userId) {
+  const schema = tgSchemaFor(userId);
+  await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+  await adminPool.query(`
+    CREATE TABLE IF NOT EXISTS ${schema}.sessions (
+      user_id TEXT PRIMARY KEY,
+      session_string TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  return schema;
+}
+
+async function tgGetUserSession(userId) {
+  const schema = await tgEnsureSchema(userId);
+  const res = await adminPool.query(
+    `SELECT session_string FROM ${schema}.sessions WHERE user_id = $1`,
+    [userId]
+  );
+  return res.rows[0]?.session_string || '';
+}
+
+async function tgSaveUserSession(userId, sessionString) {
+  const schema = await tgEnsureSchema(userId);
+  await adminPool.query(
+    `INSERT INTO ${schema}.sessions (user_id, session_string, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id) DO UPDATE SET session_string = $2, updated_at = NOW()`,
+    [userId, sessionString]
+  );
+}
+
+async function getOrCreateTgClient(userId) {
+  if (tgClients.has(userId)) return tgClients.get(userId);
+
+  const sessionString = await tgGetUserSession(userId);
+  const session = new StringSession(sessionString);
+
+  const client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
+    connectionRetries: 5,
+    useWSS: false,
   });
 
-  client.on('disconnected', () => {
-    entry.connected = false;
-    console.log(`[${userId}] disconnected`);
-  });
+  const entry = { client, connected: false };
+  tgClients.set(userId, entry);
 
-  client.on('error', (err) => {
-    console.error(`[${userId}] error:`, err?.message || err);
-  });
+  if (sessionString) {
+    try {
+      await client.connect();
+      const me = await client.getMe();
+      if (me) {
+        entry.connected = true;
+        console.log(`[TG ${userId}] reconnected from saved session`);
+      } else {
+        throw new Error('Session present but not authorized');
+      }
+    } catch (e) {
+      console.error(`[TG ${userId}] reconnect failed:`, e.message);
+      tgClients.delete(userId);
+      throw new Error('Saved session is invalid — please log in again.');
+    }
+  }
 
-  await client.init();
   return entry;
 }
 
-// ---- the server ----
+/* ═══════════════════════════════════════════════════════════════
+   MULTIPART HELPER
+   ═══════════════════════════════════════════════════════════════ */
+
+function splitMultipart(buf, boundary) {
+  const delim = Buffer.from('\r\n' + boundary);
+  const parts = [];
+  let start = 0;
+  while (true) {
+    const idx = buf.indexOf(delim, start);
+    if (idx === -1) {
+      parts.push(buf.slice(start));
+      break;
+    }
+    if (idx > start) parts.push(buf.slice(start, idx));
+    start = idx + delim.length;
+  }
+  return parts;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SERVER
+   ═══════════════════════════════════════════════════════════════ */
 
 const server = http.createServer(async (req, res) => {
-  // CORS — without these, browsers discard responses and report
-  // "Failed to fetch" even when the server answered correctly.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Secret');
 
-  // Browsers send an OPTIONS preflight before any POST that carries a custom
-  // header like X-Bridge-Secret. Answer it here and return early. No body to
-  // read, no secret to check on a preflight.
   if (req.method === 'OPTIONS') {
     res.writeHead(204).end();
     return;
@@ -87,96 +344,204 @@ const server = http.createServer(async (req, res) => {
 
   const chunks = [];
   for await (const c of req) chunks.push(c);
-  const raw = Buffer.concat(chunks).toString('utf8');
+  const rawBodyBuffer = Buffer.concat(chunks);
+  const raw = rawBodyBuffer.toString('utf8');
 
   res.setHeader('Content-Type', 'application/json');
 
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-
-  // Shared-secret gate. Every real request must carry it.
   const providedSecret = req.headers['x-bridge-secret'];
   if (providedSecret !== BRIDGE_SECRET) {
     res.writeHead(401).end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
     return;
   }
 
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+
   try {
+    /* ═══════════════ WHATSAPP ROUTES ═══════════════ */
+
     // ---- POST /pair ----
     if (req.method === 'POST' && url.pathname === '/pair') {
-      const { userId, phone } = JSON.parse(raw || '{}');
-      if (!userId || !phone) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and phone required' }));
+      const { userId, deviceId, phone } = JSON.parse(raw || '{}');
+      if (!userId || !deviceId || !phone) {
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId, deviceId, phone required' }));
+        return;
+      }
+
+      const knownDevice = waPairedDevice.get(userId);
+      if (knownDevice && knownDevice !== deviceId) {
+        console.log(`[WA ${userId}] blocked: already paired on ${knownDevice}, requested from ${deviceId}`);
+        res.writeHead(409).end(JSON.stringify({
+          ok: false,
+          error: 'This number is already linked to another device. Unlink it there first.',
+          code: 'ALREADY_PAIRED_ELSEWHERE',
+        }));
+        return;
+      }
+
+      if (waPairingInFlight.has(userId)) {
+        res.writeHead(429).end(JSON.stringify({
+          ok: false,
+          error: 'Pairing already in progress for this account. Wait a moment.',
+          code: 'PAIRING_IN_FLIGHT',
+        }));
         return;
       }
 
       const cleanPhone = String(phone).replace(/[^0-9]/g, '');
-      const entry = await getOrCreateClient(userId);
-
-      if (entry.connected) {
-        res.end(JSON.stringify({ ok: true, alreadyPaired: true, jid: entry.jid }));
+      if (cleanPhone.length < 10 || cleanPhone.length > 15) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'Invalid phone number. Use 10-15 digits with country code.',
+          code: 'BAD_PHONE',
+        }));
         return;
       }
 
-      // The WebSocket may already be up from a previous attempt. If so,
-      // connect() throws "already connected", which is harmless here.
-      try {
-        await entry.client.connect();
-      } catch (e) {
-        const m = String(e?.message || e);
-        if (!/already connected/i.test(m)) throw e;
-      }
+      const pairingPromise = (async () => {
+        const t0 = Date.now();
+        const log = (m) => console.log(`[pair ${userId}] +${Date.now() - t0}ms ${m}`);
 
-      const code = await entry.client.pairCode(cleanPhone);
-      res.end(JSON.stringify({ ok: true, code }));
+        log('getOrCreateClient...');
+        const entry = await getOrCreateWaClient(userId, deviceId);
+        log('store opened');
+
+        if (entry.connected) {
+          log('already connected');
+          return { ok: true, alreadyPaired: true, jid: entry.jid };
+        }
+
+        log('calling connect()');
+        await withTimeout(entry.client.connect(), 20000, 'connect').catch(e => {
+          if (!/already connected/i.test(String(e?.message))) throw e;
+        });
+        log('websocket connected');
+
+        log('waiting for connected flag');
+        const ok = await waWaitForConnection(entry, 60000);
+        if (!ok) {
+          throw Object.assign(
+            new Error('WhatsApp handshake did not complete within 60s. Check the Go binary logs.'),
+            { code: 'WA_CONNECT_TIMEOUT' }
+          );
+        }
+        log('flag true');
+
+        log(`calling pairCode(${cleanPhone})`);
+        try {
+          const code = await withTimeout(entry.client.pairCode(cleanPhone), 20000, 'pairCode');
+          log('got code');
+          return { ok: true, code };
+        } catch (e) {
+          const m = String(e?.message || e);
+          log(`pairCode threw: ${m}`);
+          if (m.includes('conflict') || m.includes('already') || m.includes('401')) {
+            throw Object.assign(
+              new Error('This number is already linked elsewhere. Unlink it first.'),
+              { code: 'PHONE_ALREADY_LINKED' }
+            );
+          }
+          throw e;
+        }
+      })();
+
+      waPairingInFlight.set(userId, pairingPromise);
+
+      try {
+        const result = await pairingPromise;
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        const code = e.code || null;
+        const status =
+          code === 'ALREADY_PAIRED_ELSEWHERE' || code === 'PHONE_ALREADY_LINKED' ? 409 :
+          code === 'WA_CONNECT_TIMEOUT' ? 504 :
+          500;
+        console.error(`[WA ${userId}] pair failed code=${code} msg=${e.message}`);
+        res.writeHead(status).end(JSON.stringify({
+          ok: false,
+          error: e.message || String(e),
+          code,
+        }));
+      } finally {
+        waPairingInFlight.delete(userId);
+      }
       return;
     }
 
     // ---- GET /status ----
     if (req.method === 'GET' && url.pathname === '/status') {
       const userId = url.searchParams.get('userId');
-      const entry = clients.get(userId);
+      const deviceId = url.searchParams.get('deviceId');
+      if (!userId || !deviceId) {
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and deviceId required' }));
+        return;
+      }
+      const entry = waEntryForDevice(userId, deviceId);
       res.end(JSON.stringify({
         ok: true,
         connected: !!entry?.connected,
-        jid: entry?.jid || null
+        jid: entry?.jid || null,
+        loggedOut: !!entry?.loggedOut,
       }));
       return;
     }
 
-    // ---- POST /send ----
+    // ---- POST /unpair ----
+    if (req.method === 'POST' && url.pathname === '/unpair') {
+      const { userId, deviceId } = JSON.parse(raw || '{}');
+      if (!userId || !deviceId) {
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and deviceId required' }));
+        return;
+      }
+      await waDropClient(userId, deviceId);
+      await waDestroyStore(userId, deviceId);
+      if (waPairedDevice.get(userId) === deviceId) {
+        waPairedDevice.delete(userId);
+      }
+      res.end(JSON.stringify({ ok: true, message: 'Unpaired.' }));
+      return;
+    }
+
+    // ---- POST /send ---- (WhatsApp voice note)
     if (req.method === 'POST' && url.pathname === '/send') {
-      const { userId, phone, resultId } = JSON.parse(raw || '{}');
-      if (!userId || !phone || !resultId) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId, phone, resultId required' }));
+      const { userId, deviceId, phone, resultId } = JSON.parse(raw || '{}');
+      if (!userId || !deviceId || !phone || !resultId) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId, deviceId, phone, resultId required',
+        }));
         return;
       }
 
-      const entry = clients.get(userId);
+      const entry = waEntryForDevice(userId, deviceId);
       if (!entry?.connected) {
-        res.writeHead(409).end(JSON.stringify({ ok: false, error: 'User not paired' }));
+        res.writeHead(409).end(JSON.stringify({
+          ok: false,
+          error: 'Not paired on this device',
+        }));
         return;
       }
 
       const to = String(phone).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
 
-      // 1. Fetch the converted audio from app.py
       const audioRes = await fetch(`${APP_BASE_URL}/api/result/${encodeURIComponent(resultId)}`);
       if (!audioRes.ok) {
-        res.writeHead(502).end(JSON.stringify({ ok: false, error: `Audio fetch failed: ${audioRes.status}` }));
+        res.writeHead(502).end(JSON.stringify({
+          ok: false,
+          error: `Audio fetch failed: ${audioRes.status}`,
+        }));
         return;
       }
       const inputBuf = Buffer.from(await audioRes.arrayBuffer());
 
-      // 2. Temp files — live on disk only for the length of this request.
       const tmpDir = os.tmpdir();
       const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const inPath  = path.join(tmpDir, `wa-${stamp}.wav`);
-      const outPath = path.join(tmpDir, `wa-${stamp}.ogg`);
+      const inPath  = path.join(tmpDir, `wa-in-${stamp}.wav`);
+      const outPath = path.join(tmpDir, `wa-out-${stamp}.ogg`);
 
       await fs.writeFile(inPath, inputBuf);
 
       try {
-        // 3. ffmpeg → OGG / Opus / 16kHz / mono. Required for iOS playback.
         await execAsync(
           `ffmpeg -y -i "${inPath}" ` +
           `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
@@ -186,8 +551,6 @@ const server = http.createServer(async (req, res) => {
         );
 
         const oggBuf = await fs.readFile(outPath);
-
-        // 4. Upload then send with ptt: true so it renders as a voice note.
         const media = await entry.client.uploadMedia(outPath, 'audio');
         await entry.client.sendRawMessage(to, {
           audioMessage: {
@@ -210,11 +573,343 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    /* ═══════════════ TELEGRAM ROUTES — UNCHANGED ═══════════════ */
+
+    // ---- POST /tg/start-login ----
+    if (req.method === 'POST' && url.pathname === '/tg/start-login') {
+      const { userId, phone } = JSON.parse(raw || '{}');
+      if (!userId || !phone) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and phone required',
+        }));
+        return;
+      }
+
+      const cleanPhone = String(phone).replace(/[^0-9+]/g, '');
+
+      const old = tgPendingLogins.get(userId);
+      if (old?.client) {
+        try { await old.client.disconnect(); } catch (e) {}
+      }
+
+      const session = new StringSession('');
+      const client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
+        connectionRetries: 5,
+        useWSS: false,
+      });
+
+      await client.connect();
+
+      const result = await client.invoke(new Api.auth.SendCode({
+        phoneNumber: cleanPhone,
+        apiId: TG_API_ID,
+        apiHash: TG_API_HASH,
+        settings: new Api.CodeSettings({}),
+      }));
+
+      tgPendingLogins.set(userId, {
+        client,
+        phone: cleanPhone,
+        phoneCodeHash: result.phoneCodeHash,
+      });
+
+      res.end(JSON.stringify({
+        ok: true,
+        message: 'Code sent. Check your Telegram app.',
+      }));
+      return;
+    }
+
+    // ---- POST /tg/verify ----
+    if (req.method === 'POST' && url.pathname === '/tg/verify') {
+      const { userId, code } = JSON.parse(raw || '{}');
+      if (!userId || !code) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and code required',
+        }));
+        return;
+      }
+
+      const pending = tgPendingLogins.get(userId);
+      if (!pending) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'No pending login. Start over.',
+        }));
+        return;
+      }
+
+      try {
+        await pending.client.invoke(new Api.auth.SignIn({
+          phoneNumber: pending.phone,
+          phoneCodeHash: pending.phoneCodeHash,
+          phoneCode: String(code),
+        }));
+
+        const sessionString = pending.client.session.save();
+        await tgSaveUserSession(userId, sessionString);
+
+        tgClients.set(userId, { client: pending.client, connected: true });
+        tgPendingLogins.delete(userId);
+
+        res.end(JSON.stringify({ ok: true, message: 'Logged in successfully.' }));
+      } catch (err) {
+        const m = err?.errorMessage || err?.message || String(err);
+        if (m.includes('SESSION_PASSWORD_NEEDED')) {
+          res.end(JSON.stringify({
+            ok: true,
+            passwordNeeded: true,
+            message: '2FA password required.',
+          }));
+        } else if (m.includes('PHONE_CODE_INVALID')) {
+          res.writeHead(400).end(JSON.stringify({
+            ok: false,
+            error: 'Invalid code. Try again.',
+          }));
+        } else if (m.includes('PHONE_CODE_EXPIRED')) {
+          res.writeHead(400).end(JSON.stringify({
+            ok: false,
+            error: 'Code expired. Start over.',
+          }));
+        } else {
+          res.writeHead(500).end(JSON.stringify({ ok: false, error: m }));
+        }
+      }
+      return;
+    }
+
+    // ---- POST /tg/verify-password ----
+    if (req.method === 'POST' && url.pathname === '/tg/verify-password') {
+      const { userId, password } = JSON.parse(raw || '{}');
+      if (!userId || !password) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and password required',
+        }));
+        return;
+      }
+
+      const pending = tgPendingLogins.get(userId);
+      if (!pending) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'No pending login. Start over.',
+        }));
+        return;
+      }
+
+      try {
+        const pwd = await pending.client.invoke(new Api.account.GetPassword());
+        const check = await computeCheck(pwd, password);
+        await pending.client.invoke(new Api.auth.CheckPassword({ password: check }));
+
+        const sessionString = pending.client.session.save();
+        await tgSaveUserSession(userId, sessionString);
+        tgClients.set(userId, { client: pending.client, connected: true });
+        tgPendingLogins.delete(userId);
+
+        res.end(JSON.stringify({ ok: true, message: 'Logged in successfully.' }));
+      } catch (err) {
+        const m = err?.errorMessage || err?.message || String(err);
+        if (m.includes('PASSWORD_HASH_INVALID')) {
+          res.writeHead(400).end(JSON.stringify({
+            ok: false,
+            error: 'Wrong password.',
+          }));
+        } else {
+          res.writeHead(400).end(JSON.stringify({ ok: false, error: m }));
+        }
+      }
+      return;
+    }
+
+    // ---- GET /tg/status ----
+    if (req.method === 'GET' && url.pathname === '/tg/status') {
+      const userId = url.searchParams.get('userId');
+      if (!userId) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId required',
+        }));
+        return;
+      }
+      const entry = tgClients.get(userId);
+      let hasSaved = false;
+      try { hasSaved = !!(await tgGetUserSession(userId)); } catch (e) {}
+      res.end(JSON.stringify({
+        ok: true,
+        connected: !!entry?.connected,
+        hasSavedSession: hasSaved,
+      }));
+      return;
+    }
+
+    // ---- POST /tg/send ----
+    if (req.method === 'POST' && url.pathname === '/tg/send') {
+      const { userId, to, resultId, mode } = JSON.parse(raw || '{}');
+      if (!userId || !to || !resultId) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId, to, resultId required',
+        }));
+        return;
+      }
+
+      const entry = tgClients.get(userId);
+      if (!entry?.connected) {
+        res.writeHead(409).end(JSON.stringify({
+          ok: false,
+          error: 'Not logged in. Please log in first.',
+        }));
+        return;
+      }
+
+      const audioRes = await fetch(`${APP_BASE_URL}/api/result/${encodeURIComponent(resultId)}`);
+      if (!audioRes.ok) {
+        res.writeHead(502).end(JSON.stringify({
+          ok: false,
+          error: `Audio fetch failed: ${audioRes.status}`,
+        }));
+        return;
+      }
+      const inputBuf = Buffer.from(await audioRes.arrayBuffer());
+
+      const tmpDir = os.tmpdir();
+      const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const inPath  = path.join(tmpDir, `tg-in-${stamp}.wav`);
+      const outPath = path.join(tmpDir, `tg-out-${stamp}.ogg`);
+
+      await fs.writeFile(inPath, inputBuf);
+
+      try {
+        await execAsync(
+          `ffmpeg -y -i "${inPath}" ` +
+          `-vn -c:a libopus -b:a 32k -ar 16000 -ac 1 ` +
+          `-application voip -avoid_negative_ts make_zero -map_metadata -1 ` +
+          `"${outPath}"`,
+          { timeout: 30000 }
+        );
+
+        const entity = await entry.client.getEntity(to);
+
+        const stat = await fs.stat(outPath);
+        const file = new CustomFile(path.basename(outPath), stat.size, outPath);
+        const media = await entry.client.uploadFile({ file, workers: 1 });
+
+        await entry.client.sendFile(entity, {
+          file: media,
+          voiceNote: mode !== 'video',
+          videoNote: mode === 'video',
+        });
+
+        res.end(JSON.stringify({ ok: true, to, mode: mode || 'voice' }));
+      } finally {
+        await fs.unlink(inPath).catch(() => {});
+        await fs.unlink(outPath).catch(() => {});
+      }
+      return;
+    }
+
+    // ---- POST /tg/send-video ----
+    if (req.method === 'POST' && url.pathname === '/tg/send-video') {
+      const contentType = req.headers['content-type'] || '';
+      const boundaryMatch = contentType.match(/boundary=(.+)$/);
+      if (!boundaryMatch) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'multipart/form-data required',
+        }));
+        return;
+      }
+
+      const boundary = '--' + boundaryMatch[1];
+      const parts = splitMultipart(rawBodyBuffer, boundary);
+
+      let videoBuf = null, videoName = 'video.mp4';
+      let formUserId = null, formTo = null;
+
+      for (const part of parts) {
+        const headerEnd = part.indexOf('\r\n\r\n');
+        if (headerEnd === -1) continue;
+        const headers = part.slice(0, headerEnd).toString();
+        const body = part.slice(headerEnd + 4);
+        const nameMatch = headers.match(/name="([^"]+)"/);
+        const fileMatch = headers.match(/filename="([^"]+)"/);
+        if (!nameMatch) continue;
+        const fieldName = nameMatch[1];
+        if (fieldName === 'video' && fileMatch) {
+          videoBuf = body;
+          videoName = fileMatch[1];
+        } else if (fieldName === 'userId') {
+          formUserId = body.toString().trim();
+        } else if (fieldName === 'to') {
+          formTo = body.toString().trim();
+        }
+      }
+
+      if (!videoBuf || !formUserId || !formTo) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'video, userId, to required',
+        }));
+        return;
+      }
+
+      const entry = tgClients.get(formUserId);
+      if (!entry?.connected) {
+        res.writeHead(409).end(JSON.stringify({
+          ok: false,
+          error: 'Not logged in.',
+        }));
+        return;
+      }
+
+      const tmpDir = os.tmpdir();
+      const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const ext = path.extname(videoName) || '.mp4';
+      const inPath  = path.join(tmpDir, `tgvid-in-${stamp}${ext}`);
+      const outPath = path.join(tmpDir, `tgvid-out-${stamp}.mp4`);
+
+      await fs.writeFile(inPath, videoBuf);
+
+      try {
+        await execAsync(
+          `ffmpeg -y -i "${inPath}" ` +
+          `-t 60 ` +
+          `-vf "scale=480:480:force_original_aspect_ratio=increase,crop=480:480" ` +
+          `-c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p ` +
+          `-c:a aac -b:a 64k ` +
+          `-movflags +faststart ` +
+          `"${outPath}"`,
+          { timeout: 180000 }
+        );
+
+        const entity = await entry.client.getEntity(formTo);
+
+        const stat = await fs.stat(outPath);
+        const file = new CustomFile(path.basename(outPath), stat.size, outPath);
+        const media = await entry.client.uploadFile({ file, workers: 1 });
+
+        await entry.client.sendFile(entity, { file: media, videoNote: true });
+
+        res.end(JSON.stringify({ ok: true, to: formTo, bytes: stat.size }));
+      } finally {
+        await fs.unlink(inPath).catch(() => {});
+        await fs.unlink(outPath).catch(() => {});
+      }
+      return;
+    }
+
     res.writeHead(404).end(JSON.stringify({ ok: false, error: 'not found' }));
   } catch (err) {
     console.error('request failed:', err);
-    res.writeHead(500).end(JSON.stringify({ ok: false, error: err?.message || String(err) }));
+    res.writeHead(500).end(JSON.stringify({
+      ok: false,
+      error: err?.message || String(err),
+    }));
   }
 });
 
-server.listen(PORT, () => console.log(`WA bridge on :${PORT}`));
+server.listen(PORT, () => console.log(`Combined bridge on :${PORT}`));
