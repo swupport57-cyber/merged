@@ -21,24 +21,28 @@ const { Pool } = pg;
 const PORT = process.env.PORT || 3000;
 const APP_BASE_URL = process.env.APP_BASE_URL;
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'; // set to your app's origin in production
 
-// WhatsApp store. sqlite (default) needs a persistent disk at DATA_DIR.
-// postgres needs SUPABASE_DB_URL = DIRECT or SESSION-pooler string (port 5432, NOT 6543).
 const WA_STORE_MODE = (process.env.STORE_MODE || 'sqlite').toLowerCase();
 const DATA_DIR = process.env.DATA_DIR || '/data';
 
-// Telegram (enabled only when all three are set)
 const TG_API_ID = parseInt(process.env.TG_API_ID, 10);
 const TG_API_HASH = process.env.TG_API_HASH;
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL;
 const TG_ENABLED = !!(TG_API_ID && TG_API_HASH && SUPABASE_DB_URL);
 
+// Set PURGE_LEGACY=true ONCE to delete all old userId-keyed sessions (wa_* / tg_* not owned by a device).
+const PURGE_LEGACY = String(process.env.PURGE_LEGACY || '').toLowerCase() === 'true';
+
 const INIT_TIMEOUT = 25000;
 const CONNECT_TIMEOUT = 20000;
 const PAIR_TIMEOUT = 20000;
 const LOGIN_TTL_MS = 10 * 60 * 1000;
+const PENDING_DEVICE_TTL_MS = 30 * 60 * 1000;
+const MAX_PENDING_DEVICES = 200;
 const MAX_JSON_BODY = 1_000_000;
 const MAX_VIDEO_BODY = 100 * 1024 * 1024;
+const DEVICE_HEADER = 'x-device-token';
 
 if (!APP_BASE_URL || !BRIDGE_SECRET) {
   console.error('Missing required env vars: APP_BASE_URL, BRIDGE_SECRET');
@@ -59,11 +63,9 @@ pool?.on('error', (e) => console.error('pg pool error:', e.message));
 // shared helpers
 // =====================================================================
 class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, extra = {}) { super(message); this.status = status; this.extra = extra; }
 }
-
-const safeId = (userId) =>
-  String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
+const reauth = () => new HttpError(401, 'Please sign in again on this device.', { reauth: true });
 
 function withTimeout(promise, ms, label) {
   let t;
@@ -80,6 +82,8 @@ function safeEqual(a, b) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const short = (sid) => String(sid).slice(0, 8);
 
 function json(res, code, body) {
   if (res.headersSent) return;
@@ -119,7 +123,6 @@ function tmpPaths(prefix, inExt, outExt) {
   };
 }
 
-// audio -> OGG/Opus/16k/mono (voice note format for WhatsApp and Telegram)
 async function toOggOpus(buf, prefix) {
   const { inPath, outPath } = tmpPaths(prefix, '.in', '.ogg');
   const cleanup = async () => {
@@ -142,14 +145,141 @@ async function toOggOpus(buf, prefix) {
 }
 
 // =====================================================================
-// WHATSAPP
+// DEVICE REGISTRY  (who owns which session)
+//
+// Identity comes from a random secret token issued by THIS server to the
+// device that started the sign-in. The client-supplied userId is ignored.
+// Only a hash of the token is stored. No token / unknown token => sign in again.
 // =====================================================================
-async function waStoreUrl(key) {
+const devices = new Map(); // sid -> { sid, platform, tokenHash, verified, createdAt, lastSeen }
+const byHash = new Map();  // tokenHash -> sid
+const DEVICES_FILE = path.join(DATA_DIR, 'devices.json');
+let fileWriteChain = Promise.resolve();
+
+async function registryLoad() {
+  let rows = [];
+  if (pool) {
+    await pool.query(`CREATE TABLE IF NOT EXISTS bridge_devices (
+      sid TEXT PRIMARY KEY, platform TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
+      verified BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT NOT NULL, last_seen BIGINT NOT NULL)`);
+    const r = await pool.query(
+      `SELECT sid, platform, token_hash AS "tokenHash", verified, created_at AS "createdAt", last_seen AS "lastSeen" FROM bridge_devices`
+    );
+    rows = r.rows.map((x) => ({ ...x, createdAt: Number(x.createdAt), lastSeen: Number(x.lastSeen) }));
+  } else {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    rows = JSON.parse(await fs.readFile(DEVICES_FILE, 'utf8').catch(() => '[]'));
+  }
+  for (const rec of rows) { devices.set(rec.sid, rec); byHash.set(rec.tokenHash, rec.sid); }
+  console.log(`[registry] loaded ${devices.size} device(s) (${pool ? 'postgres' : 'file'})`);
+}
+
+function registryPersistFile() {
+  fileWriteChain = fileWriteChain.then(async () => {
+    const tmp = `${DEVICES_FILE}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify([...devices.values()]));
+    await fs.rename(tmp, DEVICES_FILE);
+  }).catch((e) => console.error('registry file write failed:', e.message));
+  return fileWriteChain;
+}
+
+async function registrySave(rec) {
+  if (pool) {
+    await pool.query(
+      `INSERT INTO bridge_devices (sid, platform, token_hash, verified, created_at, last_seen)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (sid) DO UPDATE SET verified = $4, last_seen = $6`,
+      [rec.sid, rec.platform, rec.tokenHash, rec.verified, rec.createdAt, rec.lastSeen]
+    );
+  } else {
+    await registryPersistFile();
+  }
+}
+
+async function registryDelete(sid) {
+  if (pool) await pool.query(`DELETE FROM bridge_devices WHERE sid = $1`, [sid]);
+  else await registryPersistFile();
+}
+
+async function issueDevice(platform) {
+  const pending = [...devices.values()].filter((d) => !d.verified).length;
+  if (pending >= MAX_PENDING_DEVICES) throw new HttpError(503, 'Too many sign-ins in progress, try again in a few minutes.');
+  const token = crypto.randomBytes(32).toString('base64url');
+  const rec = {
+    sid: crypto.randomBytes(16).toString('hex'), // 32 hex chars, also used in store/schema names
+    platform,
+    tokenHash: sha(token),
+    verified: false,
+    createdAt: Date.now(),
+    lastSeen: Date.now(),
+  };
+  devices.set(rec.sid, rec);
+  byHash.set(rec.tokenHash, rec.sid);
+  await registrySave(rec);
+  return { token, rec };
+}
+
+function deviceFromReq(req, platform) {
+  const token = req.headers[DEVICE_HEADER];
+  if (typeof token !== 'string' || !token || token.length > 200) return null;
+  const sid = byHash.get(sha(token));
+  const rec = sid && devices.get(sid);
+  if (!rec || rec.platform !== platform) return null;
+  rec.lastSeen = Date.now();
+  return rec;
+}
+
+const requireVerifiedDevice = (req, platform) => {
+  const rec = deviceFromReq(req, platform);
+  if (!rec || !rec.verified) throw reauth();
+  return rec;
+};
+
+async function markVerified(sid) {
+  const rec = devices.get(sid);
+  if (rec && !rec.verified) {
+    rec.verified = true;
+    await registrySave(rec).catch((e) => console.error('markVerified save failed:', e.message));
+    console.log(`[registry] device ${short(sid)} verified`);
+  }
+}
+
+// Fully remove a device: disconnect, delete its stored session, forget its token.
+async function purgeDevice(sid) {
+  const rec = devices.get(sid);
+  if (!rec) return;
+  devices.delete(sid);
+  byHash.delete(rec.tokenHash);
+  try {
+    if (rec.platform === 'wa') {
+      const e = waClients.get(sid);
+      if (e) {
+        try { await e.client.logout?.(); } catch {}
+        try { await e.client.close?.(); } catch {}
+        waClients.delete(sid);
+      }
+      await waDeleteStore(sid).catch((e2) => console.error('waDeleteStore failed:', e2.message));
+    } else {
+      const e = tgClients.get(sid);
+      if (e) { await tgDispose(e.client); tgClients.delete(sid); }
+      const p = tgPendingLogins.get(sid);
+      if (p) { await tgDispose(p.client); tgPendingLogins.delete(sid); }
+      await tgDropSchema(sid).catch((e2) => console.error('tgDropSchema failed:', e2.message));
+    }
+  } finally {
+    await registryDelete(sid).catch((e) => console.error('registryDelete failed:', e.message));
+  }
+}
+
+// =====================================================================
+// WHATSAPP  (keyed by sid)
+// =====================================================================
+async function waStoreUrl(sid) {
   if (WA_STORE_MODE === 'sqlite') {
     await fs.mkdir(DATA_DIR, { recursive: true });
-    return `file:${path.join(DATA_DIR, `wa_${key}.db`)}?_foreign_keys=on`;
+    return `file:${path.join(DATA_DIR, `wa_${sid}.db`)}?_foreign_keys=on`;
   }
-  const schema = `wa_${key}`; // key is whitelisted chars only
+  const schema = `wa_${sid}`; // sid is hex, safe
   await withTimeout(pool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`), 10000, 'create schema');
   const u = new URL(SUPABASE_DB_URL);
   u.searchParams.set('sslmode', 'require');
@@ -158,67 +288,63 @@ async function waStoreUrl(key) {
   return u.toString();
 }
 
-async function waListStored() {
-  try {
-    if (WA_STORE_MODE === 'sqlite') {
-      const files = await fs.readdir(DATA_DIR).catch(() => []);
-      return files.filter((f) => /^wa_.+\.db$/.test(f)).map((f) => f.slice(3, -3));
+async function waDeleteStore(sid) {
+  if (WA_STORE_MODE === 'sqlite') {
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      await fs.unlink(path.join(DATA_DIR, `wa_${sid}.db${suffix}`)).catch(() => {});
     }
-    const r = await pool.query(
-      `SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'wa\\_%'`
-    );
-    return r.rows.map((x) => x.schema_name.slice(3));
-  } catch (e) {
-    console.error('waListStored failed:', e.message);
-    return [];
+  } else {
+    await pool.query(`DROP SCHEMA IF EXISTS wa_${sid} CASCADE`);
   }
 }
 
-const waClients = new Map(); // key -> entry (fully initialised only)
-const waPending = new Map(); // key -> Promise (dedupes concurrent init)
+const waClients = new Map(); // sid -> entry
+const waPending = new Map(); // sid -> Promise
 
-async function waGetOrCreate(userId) {
-  const key = safeId(userId); // ALWAYS key by sanitized id (one client per store file)
-  if (waClients.has(key)) return waClients.get(key);
-  if (waPending.has(key)) return waPending.get(key);
+async function waGetOrCreate(sid) {
+  if (waClients.has(sid)) return waClients.get(sid);
+  if (waPending.has(sid)) return waPending.get(sid);
 
   const p = (async () => {
-    console.log(`[wa ${key}] preparing store (${WA_STORE_MODE})...`);
-    const client = createClient({ store: await waStoreUrl(key), commandTimeout: 30000 });
-    const entry = { client, key, jid: null, connected: false };
+    const tag = `wa ${short(sid)}`;
+    console.log(`[${tag}] preparing store (${WA_STORE_MODE})...`);
+    const client = createClient({ store: await waStoreUrl(sid), commandTimeout: 30000 });
+    const entry = { client, sid, jid: null, connected: false };
 
     client.on('connected', (ev) => {
       entry.jid = ev?.jid || entry.jid;
       entry.connected = true;
-      console.log(`[wa ${key}] CONNECTED jid=${entry.jid}`);
+      console.log(`[${tag}] CONNECTED`);
+      markVerified(sid);
     });
-    client.on('disconnected', () => { entry.connected = false; console.log(`[wa ${key}] disconnected`); });
+    client.on('disconnected', () => { entry.connected = false; console.log(`[${tag}] disconnected`); });
     client.on('pair_success', (ev) => {
       entry.jid = ev?.jid || entry.jid;
-      console.log(`[wa ${key}] PAIR SUCCESS jid=${entry.jid}`);
+      console.log(`[${tag}] PAIR SUCCESS`);
+      markVerified(sid);
     });
     client.on('logged_out', () => {
+      console.log(`[${tag}] logged out from phone, removing device`);
       entry.connected = false;
       entry.jid = null;
-      console.log(`[wa ${key}] logged out from phone`);
-      waClients.delete(key);
+      waClients.delete(sid);
+      purgeDevice(sid);
     });
-    client.on('error', (err) => console.error(`[wa ${key}] error:`, err?.message || err));
+    client.on('error', (err) => console.error(`[${tag}] error:`, err?.message || err));
 
     try {
-      console.log(`[wa ${key}] init...`);
       const info = await withTimeout(client.init(), INIT_TIMEOUT, 'client.init');
       if (info?.jid) entry.jid = info.jid;
-      console.log(`[wa ${key}] init ok jid=${entry.jid || 'none (unpaired)'}`);
+      console.log(`[${tag}] init ok paired=${!!entry.jid}`);
     } catch (e) {
       try { await client.close?.(); } catch {}
       throw e; // never cache a broken client
     }
-    waClients.set(key, entry);
+    waClients.set(sid, entry);
     return entry;
-  })().finally(() => waPending.delete(key));
+  })().finally(() => waPending.delete(sid));
 
-  waPending.set(key, p);
+  waPending.set(sid, p);
   return p;
 }
 
@@ -233,77 +359,88 @@ async function waEnsureConnected(entry) {
 }
 
 async function waRestoreAll() {
-  const keys = await waListStored();
-  console.log(`[wa] restoring ${keys.length} stored session(s)`);
-  for (const key of keys) {
+  const sids = [...devices.values()].filter((d) => d.platform === 'wa' && d.verified).map((d) => d.sid);
+  console.log(`[wa] restoring ${sids.length} device session(s)`);
+  for (const sid of sids) {
     try {
-      const entry = await waGetOrCreate(key);
+      const entry = await waGetOrCreate(sid);
       if (entry.jid) await waEnsureConnected(entry);
     } catch (e) {
-      console.error(`[wa ${key}] restore failed:`, e.message);
+      console.error(`[wa ${short(sid)}] restore failed:`, e.message);
     }
   }
 }
 
 async function waPair(ctx) {
-  const { userId, phone } = parseJson(ctx.body);
-  if (!userId || !phone) throw new HttpError(400, 'userId and phone required');
-  const cleanPhone = String(phone).replace(/[^0-9]/g, '');
+  const { phone } = parseJson(ctx.body); // any userId in the body is ignored on purpose
+  const cleanPhone = String(phone || '').replace(/[^0-9]/g, '');
   if (cleanPhone.length < 8) throw new HttpError(400, 'Phone must include country code, digits only');
 
-  const t0 = Date.now();
-  const log = (m) => console.log(`[wa pair ${safeId(userId)}] +${Date.now() - t0}ms ${m}`);
-
-  log('getOrCreate...');
-  const entry = await waGetOrCreate(userId);
-  log('store opened');
-
-  if (entry.jid) {
-    await waEnsureConnected(entry);
-    if (entry.connected) {
-      log('already paired');
-      return json(ctx.res, 200, { ok: true, alreadyPaired: true, jid: entry.jid });
-    }
+  let rec = deviceFromReq(ctx.req, 'wa');
+  let newToken = null;
+  if (!rec) {
+    const issued = await issueDevice('wa');
+    rec = issued.rec;
+    newToken = issued.token;
   }
+
+  const t0 = Date.now();
+  const log = (m) => console.log(`[wa pair ${short(rec.sid)}] +${Date.now() - t0}ms ${m}`);
 
   try {
-    await withTimeout(entry.client.connect(), CONNECT_TIMEOUT, 'connect');
-  } catch (e) {
-    if (!/already connected/i.test(String(e?.message))) throw e;
-  }
-  log('websocket connected');
+    log('getOrCreate...');
+    const entry = await waGetOrCreate(rec.sid);
+    log('store opened');
 
-  const code = await withTimeout(entry.client.pairCode(cleanPhone), PAIR_TIMEOUT, 'pairCode');
-  log(`got code ${code}`);
-  json(ctx.res, 200, { ok: true, code });
+    if (entry.jid && rec.verified) {
+      await waEnsureConnected(entry);
+      if (entry.connected) {
+        log('already paired');
+        return json(ctx.res, 200, { ok: true, alreadyPaired: true, jid: entry.jid, ...(newToken && { deviceToken: newToken }) });
+      }
+    }
+
+    try {
+      await withTimeout(entry.client.connect(), CONNECT_TIMEOUT, 'connect');
+    } catch (e) {
+      if (!/already connected/i.test(String(e?.message))) throw e;
+    }
+    log('websocket connected');
+
+    const code = await withTimeout(entry.client.pairCode(cleanPhone), PAIR_TIMEOUT, 'pairCode');
+    log('got code');
+    json(ctx.res, 200, { ok: true, code, ...(newToken && { deviceToken: newToken }) });
+  } catch (e) {
+    if (newToken) await purgeDevice(rec.sid); // don't leave orphan sessions behind
+    throw e;
+  }
 }
 
 async function waStatus(ctx) {
-  const userId = ctx.url.searchParams.get('userId');
-  if (!userId) throw new HttpError(400, 'userId required');
-  const key = safeId(userId);
+  const rec = deviceFromReq(ctx.req, 'wa');
+  if (!rec) return json(ctx.res, 200, { ok: true, connected: false, paired: false, signInRequired: true });
 
-  let entry = waClients.get(key);
-  if (!entry) {
-    const stored = await waListStored();
-    if (stored.includes(key)) entry = await waGetOrCreate(userId).catch(() => null);
-  }
+  let entry = waClients.get(rec.sid);
+  if (!entry && rec.verified) entry = await waGetOrCreate(rec.sid).catch(() => null);
   if (entry?.jid && !entry.connected) await waEnsureConnected(entry).catch(() => {});
+  if (entry?.connected && !rec.verified) await markVerified(rec.sid);
 
   json(ctx.res, 200, {
     ok: true,
     connected: !!entry?.connected,
-    paired: !!entry?.jid,
-    jid: entry?.jid || null,
+    paired: !!entry?.jid && rec.verified,
+    jid: rec.verified ? entry?.jid || null : null,
+    signInRequired: false,
   });
 }
 
 async function waSend(ctx) {
-  const { userId, phone, resultId } = parseJson(ctx.body);
-  if (!userId || !phone || !resultId) throw new HttpError(400, 'userId, phone, resultId required');
+  const rec = requireVerifiedDevice(ctx.req, 'wa');
+  const { phone, resultId } = parseJson(ctx.body);
+  if (!phone || !resultId) throw new HttpError(400, 'phone, resultId required');
 
-  const entry = await waGetOrCreate(userId);
-  if (!entry.jid) throw new HttpError(409, 'User not paired');
+  const entry = await waGetOrCreate(rec.sid);
+  if (!entry.jid) throw reauth();
   await waEnsureConnected(entry);
   if (!entry.connected) throw new HttpError(409, 'WhatsApp not connected yet, retry shortly');
 
@@ -321,7 +458,6 @@ async function waSend(ctx) {
       mimetype: 'audio/ogg; codecs=opus',
     };
     const mediaUrl = media.URL ?? media.url;
-    // Protobuf JSON names are URL / PTT (uppercase); lowercase kept as fallback.
     const variants = [
       { ...base, URL: mediaUrl, PTT: true },
       { ...base, url: mediaUrl, ptt: true },
@@ -335,7 +471,7 @@ async function waSend(ctx) {
       } catch (e) {
         lastErr = e;
         if (!/unknown field/i.test(String(e?.message))) break;
-        console.warn(`[wa ${entry.key}] proto field mismatch, trying next variant: ${e.message}`);
+        console.warn(`[wa ${short(rec.sid)}] proto field mismatch, trying next variant`);
       }
     }
     if (lastErr) throw lastErr;
@@ -346,30 +482,23 @@ async function waSend(ctx) {
 }
 
 async function waLogout(ctx) {
-  const { userId } = parseJson(ctx.body);
-  if (!userId) throw new HttpError(400, 'userId required');
-  const key = safeId(userId);
-  const entry = waClients.get(key);
-  if (entry) {
-    try { await entry.client.logout?.(); } catch {}
-    try { await entry.client.close?.(); } catch {}
-    waClients.delete(key);
-  }
+  const rec = deviceFromReq(ctx.req, 'wa');
+  if (rec) await purgeDevice(rec.sid);
   json(ctx.res, 200, { ok: true });
 }
 
 // =====================================================================
-// TELEGRAM
+// TELEGRAM  (keyed by sid)
 // =====================================================================
-const tgClients = new Map();       // userId -> { client, connected }
-const tgRestoring = new Map();     // userId -> Promise
-const tgPendingLogins = new Map(); // userId -> { client, phone, phoneCodeHash, createdAt }
+const tgClients = new Map();       // sid -> { client, connected }
+const tgRestoring = new Map();     // sid -> Promise
+const tgPendingLogins = new Map(); // sid -> { client, phone, phoneCodeHash, createdAt }
 const tgSchemasReady = new Set();
 
-const tgSchemaFor = (userId) => `tg_${safeId(userId)}`;
+const tgSchemaFor = (sid) => `tg_${sid}`;
 
-async function tgEnsureSchema(userId) {
-  const schema = tgSchemaFor(userId);
+async function tgEnsureSchema(sid) {
+  const schema = tgSchemaFor(sid);
   if (tgSchemasReady.has(schema)) return schema;
   await pool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
   await pool.query(`
@@ -383,39 +512,25 @@ async function tgEnsureSchema(userId) {
   return schema;
 }
 
-async function tgGetSession(userId) {
-  const schema = await tgEnsureSchema(userId);
-  const r = await pool.query(`SELECT session_string FROM ${schema}.sessions WHERE user_id = $1`, [userId]);
+async function tgDropSchema(sid) {
+  tgSchemasReady.delete(tgSchemaFor(sid));
+  if (pool) await pool.query(`DROP SCHEMA IF EXISTS ${tgSchemaFor(sid)} CASCADE`);
+}
+
+async function tgGetSession(sid) {
+  const schema = await tgEnsureSchema(sid);
+  const r = await pool.query(`SELECT session_string FROM ${schema}.sessions WHERE user_id = $1`, [sid]);
   return r.rows[0]?.session_string || '';
 }
 
-async function tgSaveSession(userId, sessionString) {
-  const schema = await tgEnsureSchema(userId);
+async function tgSaveSession(sid, sessionString) {
+  const schema = await tgEnsureSchema(sid);
   await pool.query(
     `INSERT INTO ${schema}.sessions (user_id, session_string, updated_at)
      VALUES ($1, $2, NOW())
      ON CONFLICT (user_id) DO UPDATE SET session_string = $2, updated_at = NOW()`,
-    [userId, sessionString]
+    [sid, sessionString]
   );
-}
-
-async function tgListStoredUserIds() {
-  try {
-    const schemas = await pool.query(
-      `SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'tg\\_%'`
-    );
-    const ids = [];
-    for (const { schema_name } of schemas.rows) {
-      try {
-        const r = await pool.query(`SELECT user_id FROM "${schema_name}".sessions`);
-        for (const row of r.rows) ids.push(row.user_id);
-      } catch { /* schema without sessions table */ }
-    }
-    return ids;
-  } catch (e) {
-    console.error('tgListStoredUserIds failed:', e.message);
-    return [];
-  }
 }
 
 function newTgClient(sessionString = '') {
@@ -432,13 +547,12 @@ async function tgDispose(client) {
   try { await client.destroy?.(); } catch {}
 }
 
-// Restore a logged-in client from its saved session. Returns null if none saved.
-async function tgRestore(userId) {
-  if (tgClients.has(userId)) return tgClients.get(userId);
-  if (tgRestoring.has(userId)) return tgRestoring.get(userId);
+async function tgRestore(sid) {
+  if (tgClients.has(sid)) return tgClients.get(sid);
+  if (tgRestoring.has(sid)) return tgRestoring.get(sid);
 
   const p = (async () => {
-    const sessionString = await tgGetSession(userId);
+    const sessionString = await tgGetSession(sid);
     if (!sessionString) return null;
 
     const client = newTgClient(sessionString);
@@ -447,21 +561,21 @@ async function tgRestore(userId) {
       if (!(await client.isUserAuthorized())) throw new Error('Saved session is no longer authorized');
     } catch (e) {
       await tgDispose(client);
-      console.error(`[tg ${userId}] restore failed:`, e.message);
-      throw new HttpError(401, 'Saved Telegram session is invalid. Please log in again.');
+      console.error(`[tg ${short(sid)}] restore failed:`, e.message);
+      throw reauth();
     }
     const entry = { client, connected: true };
-    tgClients.set(userId, entry);
-    console.log(`[tg ${userId}] restored from saved session`);
+    tgClients.set(sid, entry);
+    console.log(`[tg ${short(sid)}] restored from saved session`);
     return entry;
-  })().finally(() => tgRestoring.delete(userId));
+  })().finally(() => tgRestoring.delete(sid));
 
-  tgRestoring.set(userId, p);
+  tgRestoring.set(sid, p);
   return p;
 }
 
-async function tgActive(userId) {
-  const entry = await tgRestore(userId);
+async function tgActive(sid) {
+  const entry = await tgRestore(sid);
   if (!entry) return null;
   if (!entry.client.connected) {
     try { await withTimeout(entry.client.connect(), CONNECT_TIMEOUT, 'telegram reconnect'); }
@@ -470,12 +584,13 @@ async function tgActive(userId) {
   return entry;
 }
 
-async function tgFinishLogin(userId, client) {
-  await tgSaveSession(userId, client.session.save());
-  const old = tgClients.get(userId);
+async function tgFinishLogin(sid, client) {
+  await tgSaveSession(sid, client.session.save());
+  const old = tgClients.get(sid);
   if (old && old.client !== client) await tgDispose(old.client);
-  tgClients.set(userId, { client, connected: true });
-  tgPendingLogins.delete(userId);
+  tgClients.set(sid, { client, connected: true });
+  tgPendingLogins.delete(sid);
+  await markVerified(sid);
 }
 
 function tgMapError(err) {
@@ -493,15 +608,31 @@ function requireTg() {
   if (!TG_ENABLED) throw new HttpError(503, 'Telegram is not configured on this server');
 }
 
+// For verify steps: the device must hold the token that started this login.
+function requirePendingLogin(req) {
+  const rec = deviceFromReq(req, 'tg');
+  if (!rec) throw reauth();
+  const pending = tgPendingLogins.get(rec.sid);
+  if (!pending) throw new HttpError(400, 'No pending login. Start over.');
+  return { rec, pending };
+}
+
 async function tgStartLogin(ctx) {
   requireTg();
-  const { userId, phone } = parseJson(ctx.body);
-  if (!userId || !phone) throw new HttpError(400, 'userId and phone required');
-  const cleanPhone = String(phone).replace(/[^0-9+]/g, '');
+  const { phone } = parseJson(ctx.body); // any userId in the body is ignored on purpose
+  const cleanPhone = String(phone || '').replace(/[^0-9+]/g, '');
   if (cleanPhone.replace(/\D/g, '').length < 8) throw new HttpError(400, 'Invalid phone number');
 
-  const old = tgPendingLogins.get(userId);
-  if (old) { tgPendingLogins.delete(userId); await tgDispose(old.client); }
+  let rec = deviceFromReq(ctx.req, 'tg');
+  let newToken = null;
+  if (!rec) {
+    const issued = await issueDevice('tg');
+    rec = issued.rec;
+    newToken = issued.token;
+  }
+
+  const old = tgPendingLogins.get(rec.sid);
+  if (old) { tgPendingLogins.delete(rec.sid); await tgDispose(old.client); }
 
   const client = newTgClient('');
   try {
@@ -512,20 +643,20 @@ async function tgStartLogin(ctx) {
       apiHash: TG_API_HASH,
       settings: new Api.CodeSettings({}),
     }));
-    tgPendingLogins.set(userId, { client, phone: cleanPhone, phoneCodeHash: result.phoneCodeHash, createdAt: Date.now() });
+    tgPendingLogins.set(rec.sid, { client, phone: cleanPhone, phoneCodeHash: result.phoneCodeHash, createdAt: Date.now() });
   } catch (e) {
     await tgDispose(client);
+    if (newToken) await purgeDevice(rec.sid);
     throw tgMapError(e);
   }
-  json(ctx.res, 200, { ok: true, message: 'Code sent. Check your Telegram app.' });
+  json(ctx.res, 200, { ok: true, message: 'Code sent. Check your Telegram app.', ...(newToken && { deviceToken: newToken }) });
 }
 
 async function tgVerify(ctx) {
   requireTg();
-  const { userId, code } = parseJson(ctx.body);
-  if (!userId || !code) throw new HttpError(400, 'userId and code required');
-  const pending = tgPendingLogins.get(userId);
-  if (!pending) throw new HttpError(400, 'No pending login. Start over.');
+  const { code } = parseJson(ctx.body);
+  if (!code) throw new HttpError(400, 'code required');
+  const { rec, pending } = requirePendingLogin(ctx.req);
 
   try {
     await pending.client.invoke(new Api.auth.SignIn({
@@ -533,7 +664,7 @@ async function tgVerify(ctx) {
       phoneCodeHash: pending.phoneCodeHash,
       phoneCode: String(code).replace(/\s/g, ''),
     }));
-    await tgFinishLogin(userId, pending.client);
+    await tgFinishLogin(rec.sid, pending.client);
     json(ctx.res, 200, { ok: true, message: 'Logged in successfully.' });
   } catch (err) {
     const m = err?.errorMessage || err?.message || '';
@@ -541,7 +672,7 @@ async function tgVerify(ctx) {
       return json(ctx.res, 200, { ok: true, passwordNeeded: true, message: '2FA password required.' });
     }
     if (/PHONE_CODE_EXPIRED/.test(m)) {
-      tgPendingLogins.delete(userId);
+      tgPendingLogins.delete(rec.sid);
       await tgDispose(pending.client);
     }
     throw tgMapError(err);
@@ -550,16 +681,15 @@ async function tgVerify(ctx) {
 
 async function tgVerifyPassword(ctx) {
   requireTg();
-  const { userId, password } = parseJson(ctx.body);
-  if (!userId || !password) throw new HttpError(400, 'userId and password required');
-  const pending = tgPendingLogins.get(userId);
-  if (!pending) throw new HttpError(400, 'No pending login. Start over.');
+  const { password } = parseJson(ctx.body);
+  if (!password) throw new HttpError(400, 'password required');
+  const { rec, pending } = requirePendingLogin(ctx.req);
 
   try {
     const pwd = await pending.client.invoke(new Api.account.GetPassword());
     const check = await computeCheck(pwd, password);
     await pending.client.invoke(new Api.auth.CheckPassword({ password: check }));
-    await tgFinishLogin(userId, pending.client);
+    await tgFinishLogin(rec.sid, pending.client);
     json(ctx.res, 200, { ok: true, message: 'Logged in successfully.' });
   } catch (err) {
     throw tgMapError(err);
@@ -568,25 +698,28 @@ async function tgVerifyPassword(ctx) {
 
 async function tgStatus(ctx) {
   requireTg();
-  const userId = ctx.url.searchParams.get('userId');
-  if (!userId) throw new HttpError(400, 'userId required');
+  const rec = deviceFromReq(ctx.req, 'tg');
+  if (!rec) return json(ctx.res, 200, { ok: true, connected: false, hasSavedSession: false, signInRequired: true });
 
-  let hasSaved = false;
-  try { hasSaved = !!(await tgGetSession(userId)); } catch {}
+  let entry = tgClients.get(rec.sid);
+  if (!entry && rec.verified) entry = await tgRestore(rec.sid).catch(() => null);
 
-  let entry = tgClients.get(userId);
-  if (!entry && hasSaved) entry = await tgRestore(userId).catch(() => null);
-
-  json(ctx.res, 200, { ok: true, connected: !!entry?.connected, hasSavedSession: hasSaved });
+  json(ctx.res, 200, {
+    ok: true,
+    connected: !!entry?.connected,
+    hasSavedSession: rec.verified,
+    signInRequired: rec.verified && !entry,
+  });
 }
 
 async function tgSend(ctx) {
   requireTg();
-  const { userId, to, resultId } = parseJson(ctx.body);
-  if (!userId || !to || !resultId) throw new HttpError(400, 'userId, to, resultId required');
+  const rec = requireVerifiedDevice(ctx.req, 'tg');
+  const { to, resultId } = parseJson(ctx.body);
+  if (!to || !resultId) throw new HttpError(400, 'to, resultId required');
 
-  const entry = await tgActive(userId);
-  if (!entry) throw new HttpError(409, 'Not logged in. Please log in first.');
+  const entry = await tgActive(rec.sid);
+  if (!entry) throw reauth();
 
   const { outPath, cleanup } = await toOggOpus(await fetchResultAudio(resultId), 'tg');
   try {
@@ -594,7 +727,6 @@ async function tgSend(ctx) {
     const stat = await fs.stat(outPath);
     const file = new CustomFile(path.basename(outPath), stat.size, outPath);
     const media = await entry.client.uploadFile({ file, workers: 1 });
-    // /tg/send is audio only. Video notes go through /tg/send-video.
     await entry.client.sendFile(entity, { file: media, voiceNote: true });
     json(ctx.res, 200, { ok: true, to, mode: 'voice' });
   } finally {
@@ -612,11 +744,11 @@ function parseMultipart(buf, contentType) {
   let pos = buf.indexOf(boundary);
   while (pos !== -1) {
     let start = pos + boundary.length;
-    if (buf[start] === 0x2d && buf[start + 1] === 0x2d) break; // closing boundary
+    if (buf[start] === 0x2d && buf[start + 1] === 0x2d) break;
     if (buf[start] === 0x0d && buf[start + 1] === 0x0a) start += 2;
     const next = buf.indexOf(boundary, start);
     if (next === -1) break;
-    const part = buf.subarray(start, Math.max(start, next - 2)); // strip CRLF before boundary
+    const part = buf.subarray(start, Math.max(start, next - 2));
     const he = part.indexOf('\r\n\r\n');
     if (he !== -1) {
       const head = part.subarray(0, he).toString('utf8');
@@ -635,16 +767,14 @@ function parseMultipart(buf, contentType) {
 
 async function tgSendVideo(ctx) {
   requireTg();
+  const rec = requireVerifiedDevice(ctx.req, 'tg');
   const { fields, files } = parseMultipart(ctx.body, ctx.req.headers['content-type']);
   const video = files.video;
-  if (!video?.data?.length || !fields.userId || !fields.to) {
-    throw new HttpError(400, 'video, userId, to required');
-  }
+  if (!video?.data?.length || !fields.to) throw new HttpError(400, 'video, to required');
 
-  const entry = await tgActive(fields.userId);
-  if (!entry) throw new HttpError(409, 'Not logged in.');
+  const entry = await tgActive(rec.sid);
+  if (!entry) throw reauth();
 
-  // Input and output MUST have different names, or ffmpeg refuses in-place edits.
   const ext = (path.extname(video.filename).replace(/[^.a-z0-9]/gi, '').slice(0, 8)) || '.mp4';
   const { inPath, outPath } = tmpPaths('tgvid', ext, '.mp4');
   await fs.writeFile(inPath, video.data);
@@ -676,22 +806,68 @@ async function tgSendVideo(ctx) {
   }
 }
 
+async function tgLogout(ctx) {
+  requireTg();
+  const rec = deviceFromReq(ctx.req, 'tg');
+  if (rec) {
+    const entry = tgClients.get(rec.sid);
+    if (entry) { try { await entry.client.invoke(new Api.auth.LogOut()); } catch {} }
+    await purgeDevice(rec.sid);
+  }
+  json(ctx.res, 200, { ok: true });
+}
+
 async function tgRestoreAll() {
   if (!TG_ENABLED) return;
-  const ids = await tgListStoredUserIds();
-  console.log(`[tg] restoring ${ids.length} stored session(s)`);
-  for (const id of ids) {
-    try { await tgRestore(id); } catch { /* already logged */ }
+  const sids = [...devices.values()].filter((d) => d.platform === 'tg' && d.verified).map((d) => d.sid);
+  console.log(`[tg] restoring ${sids.length} device session(s)`);
+  for (const sid of sids) {
+    try { await tgRestore(sid); } catch { /* already logged */ }
   }
 }
 
-// drop abandoned login attempts so sockets don't pile up
+// =====================================================================
+// maintenance
+// =====================================================================
+async function purgeLegacy() {
+  const keep = new Set();
+  for (const d of devices.values()) keep.add(`${d.platform}_${d.sid}`);
+  let dropped = 0;
+
+  if (pool) {
+    const r = await pool.query(
+      `SELECT schema_name FROM information_schema.schemata WHERE schema_name ~ '^(wa|tg)_[a-z0-9_]+$'`
+    );
+    for (const { schema_name } of r.rows) {
+      if (!keep.has(schema_name)) {
+        await pool.query(`DROP SCHEMA IF EXISTS "${schema_name}" CASCADE`);
+        dropped++;
+        console.log(`[purge-legacy] dropped schema ${schema_name}`);
+      }
+    }
+    tgSchemasReady.clear();
+  }
+  const files = await fs.readdir(DATA_DIR).catch(() => []);
+  for (const f of files) {
+    const m = /^(wa_[a-z0-9_]+)\.db(-wal|-shm|-journal)?$/.exec(f);
+    if (m && !keep.has(m[1])) {
+      await fs.unlink(path.join(DATA_DIR, f)).catch(() => {});
+      dropped++;
+      console.log(`[purge-legacy] deleted ${f}`);
+    }
+  }
+  console.log(`[purge-legacy] done, removed ${dropped} legacy item(s)`);
+}
+
 setInterval(() => {
   const now = Date.now();
-  for (const [userId, p] of tgPendingLogins) {
-    if (now - p.createdAt > LOGIN_TTL_MS) {
-      tgPendingLogins.delete(userId);
-      tgDispose(p.client);
+  for (const [sid, p] of tgPendingLogins) {
+    if (now - p.createdAt > LOGIN_TTL_MS) { tgPendingLogins.delete(sid); tgDispose(p.client); }
+  }
+  for (const rec of [...devices.values()]) {
+    if (!rec.verified && now - rec.createdAt > PENDING_DEVICE_TTL_MS) {
+      console.log(`[registry] purging unverified device ${short(rec.sid)}`);
+      purgeDevice(rec.sid);
     }
   }
 }, 60_000).unref();
@@ -700,24 +876,24 @@ setInterval(() => {
 // router
 // =====================================================================
 const routes = {
-  // WhatsApp
   'POST /pair':   { limit: MAX_JSON_BODY, fn: waPair },
   'GET /status':  { limit: 0,             fn: waStatus },
   'POST /send':   { limit: MAX_JSON_BODY, fn: waSend },
   'POST /logout': { limit: MAX_JSON_BODY, fn: waLogout },
-  // Telegram
   'POST /tg/start-login':     { limit: MAX_JSON_BODY,  fn: tgStartLogin },
   'POST /tg/verify':          { limit: MAX_JSON_BODY,  fn: tgVerify },
   'POST /tg/verify-password': { limit: MAX_JSON_BODY,  fn: tgVerifyPassword },
   'GET /tg/status':           { limit: 0,              fn: tgStatus },
   'POST /tg/send':            { limit: MAX_JSON_BODY,  fn: tgSend },
   'POST /tg/send-video':      { limit: MAX_VIDEO_BODY, fn: tgSendVideo },
+  'POST /tg/logout':          { limit: MAX_JSON_BODY,  fn: tgLogout },
 };
 
 const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Secret');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Secret, X-Device-Token');
 
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
 
@@ -735,22 +911,28 @@ const server = http.createServer(async (req, res) => {
     const route = routes[`${req.method} ${url.pathname}`];
     if (!route) return json(res, 404, { ok: false, error: 'not found' });
 
+    res.setHeader('Cache-Control', 'no-store');
     const body = route.limit ? await readBody(req, route.limit) : Buffer.alloc(0);
     await route.fn({ req, res, url, body });
   } catch (err) {
     const status = err instanceof HttpError ? err.status : 500;
     if (status >= 500) console.error('request failed:', err);
-    json(res, status, { ok: false, error: err?.message || String(err) });
+    json(res, status, { ok: false, error: err?.message || String(err), ...(err instanceof HttpError ? err.extra : {}) });
   }
 });
 
 server.requestTimeout = 10 * 60 * 1000;
 
-server.listen(PORT, () => {
-  console.log(`Bridge on :${PORT} (wa store=${WA_STORE_MODE}, telegram=${TG_ENABLED ? 'on' : 'off'})`);
-  waRestoreAll().catch((e) => console.error('waRestoreAll error:', e));
-  tgRestoreAll().catch((e) => console.error('tgRestoreAll error:', e));
-});
+async function main() {
+  await registryLoad();
+  if (PURGE_LEGACY) await purgeLegacy().catch((e) => console.error('purgeLegacy failed:', e));
+  server.listen(PORT, () => {
+    console.log(`Bridge on :${PORT} (wa store=${WA_STORE_MODE}, telegram=${TG_ENABLED ? 'on' : 'off'})`);
+    waRestoreAll().catch((e) => console.error('waRestoreAll error:', e));
+    tgRestoreAll().catch((e) => console.error('tgRestoreAll error:', e));
+  });
+}
+main().catch((e) => { console.error('fatal startup error:', e); process.exit(1); });
 
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
 
