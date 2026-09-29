@@ -29,54 +29,129 @@ if (!SUPABASE_DB_URL || !APP_BASE_URL || !BRIDGE_SECRET) {
 
 const adminPool = new Pool({ connectionString: SUPABASE_DB_URL });
 
-// WhatsApp clients, keyed by userId
-const waClients = new Map();
-
-// Telegram clients, keyed by userId
-const tgClients = new Map();
-const tgPendingLogins = new Map();
-
 /* ═══════════════════════════════════════════════════════════════
-   WHATSAPP (whatsmeow-node)
+   WHATSAPP STATE (strictly device-based)
    ═══════════════════════════════════════════════════════════════ */
 
-async function waStoreUrlForUser(userId) {
-  const safe = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
-  const schema = `wa_${safe}`;
+// In-memory WhatsApp clients, keyed by "userId:deviceId".
+const waClients = new Map();
+
+// userId -> deviceId that is currently paired. When a request arrives with a
+// different deviceId, the old pairing is invalidated before the new one is
+// created.
+const waPairedDevice = new Map();
+
+function waCacheKey(userId, deviceId) {
+  return `${userId}:${deviceId}`;
+}
+
+function waSchemaFor(userId, deviceId) {
+  const u = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24) || 'default';
+  const d = String(deviceId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24) || 'default';
+  return `wa_${u}_${d}`;
+}
+
+async function waStoreUrlForUser(userId, deviceId) {
+  const schema = waSchemaFor(userId, deviceId);
   await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
   const sep = SUPABASE_DB_URL.includes('?') ? '&' : '?';
   return `${SUPABASE_DB_URL}${sep}options=-csearch_path%3D${schema}`;
 }
 
-async function getOrCreateWaClient(userId) {
-  if (waClients.has(userId)) return waClients.get(userId);
+async function waDestroyStore(userId, deviceId) {
+  const schema = waSchemaFor(userId, deviceId);
+  try {
+    await adminPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    console.log(`[WA ${userId}/${deviceId}] dropped schema ${schema}`);
+  } catch (e) {
+    console.error(`[WA ${userId}/${deviceId}] drop schema failed:`, e.message);
+  }
+}
 
-  const storeUrl = await waStoreUrlForUser(userId);
+async function waDestroyAllStoresForUser(userId) {
+  const prefix = `wa_${String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24)}_`;
+  try {
+    const res = await adminPool.query(
+      `SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE $1`,
+      [prefix + '%']
+    );
+    for (const row of res.rows) {
+      await adminPool.query(`DROP SCHEMA IF EXISTS ${row.schema_name} CASCADE`);
+      console.log(`[WA ${userId}] dropped stale schema ${row.schema_name}`);
+    }
+  } catch (e) {
+    console.error(`[WA ${userId}] destroy-all failed:`, e.message);
+  }
+}
+
+async function waDropClient(userId, deviceId) {
+  const key = waCacheKey(userId, deviceId);
+  const entry = waClients.get(key);
+  if (!entry) return;
+  try {
+    if (entry.client) {
+      try { await entry.client.disconnect(); } catch (e) {}
+      try { if (typeof entry.client.close === 'function') await entry.client.close(); } catch (e) {}
+    }
+  } catch (e) {
+    console.error(`[WA ${key}] client close failed:`, e.message);
+  }
+  waClients.delete(key);
+}
+
+async function getOrCreateWaClient(userId, deviceId) {
+  const key = waCacheKey(userId, deviceId);
+
+  // Strictly device-based: if this user is paired on another device, drop
+  // the old pairing before creating the new one.
+  const knownDevice = waPairedDevice.get(userId);
+  if (knownDevice && knownDevice !== deviceId) {
+    console.log(`[WA ${userId}] device changed ${knownDevice} -> ${deviceId}, invalidating`);
+    await waDropClient(userId, knownDevice);
+    await waDestroyAllStoresForUser(userId);
+    waPairedDevice.delete(userId);
+  }
+
+  if (waClients.has(key)) return waClients.get(key);
+
+  const storeUrl = await waStoreUrlForUser(userId, deviceId);
   const client = createClient({ store: storeUrl, commandTimeout: 120000 });
 
-  const entry = { client, jid: null, connected: false };
-  waClients.set(userId, entry);
+  const entry = { client, jid: null, connected: false, deviceId };
+  waClients.set(key, entry);
 
   client.on('connected', ({ jid }) => {
     entry.jid = jid;
     entry.connected = true;
-    console.log(`[WA ${userId}] connected as ${jid}`);
+    waPairedDevice.set(userId, deviceId);
+    console.log(`[WA ${userId}/${deviceId}] connected as ${jid}`);
   });
+
   client.on('disconnected', () => {
     entry.connected = false;
-    console.log(`[WA ${userId}] disconnected`);
+    console.log(`[WA ${userId}/${deviceId}] disconnected`);
   });
+
   client.on('error', (err) => {
-    console.error(`[WA ${userId}] error:`, err?.message || err);
+    console.error(`[WA ${userId}/${deviceId}] error:`, err?.message || err);
   });
 
   await client.init();
   return entry;
 }
 
+function waEntryForDevice(userId, deviceId) {
+  const knownDevice = waPairedDevice.get(userId);
+  if (knownDevice && knownDevice !== deviceId) return null;
+  return waClients.get(waCacheKey(userId, deviceId)) || null;
+}
+
 /* ═══════════════════════════════════════════════════════════════
-   TELEGRAM (GramJS)
+   TELEGRAM STATE (GramJS)
    ═══════════════════════════════════════════════════════════════ */
+
+const tgClients = new Map();
+const tgPendingLogins = new Map();
 
 function tgSchemaFor(userId) {
   const safe = String(userId).toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 40) || 'default';
@@ -203,14 +278,17 @@ const server = http.createServer(async (req, res) => {
 
     // ---- POST /pair ----
     if (req.method === 'POST' && url.pathname === '/pair') {
-      const { userId, phone } = JSON.parse(raw || '{}');
-      if (!userId || !phone) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and phone required' }));
+      const { userId, deviceId, phone } = JSON.parse(raw || '{}');
+      if (!userId || !deviceId || !phone) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId, deviceId, phone required',
+        }));
         return;
       }
 
       const cleanPhone = String(phone).replace(/[^0-9]/g, '');
-      const entry = await getOrCreateWaClient(userId);
+      const entry = await getOrCreateWaClient(userId, deviceId);
 
       if (entry.connected) {
         res.end(JSON.stringify({ ok: true, alreadyPaired: true, jid: entry.jid }));
@@ -232,26 +310,59 @@ const server = http.createServer(async (req, res) => {
     // ---- GET /status ----
     if (req.method === 'GET' && url.pathname === '/status') {
       const userId = url.searchParams.get('userId');
-      const entry = waClients.get(userId);
+      const deviceId = url.searchParams.get('deviceId');
+      if (!userId || !deviceId) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and deviceId required',
+        }));
+        return;
+      }
+      const entry = waEntryForDevice(userId, deviceId);
       res.end(JSON.stringify({
         ok: true,
         connected: !!entry?.connected,
-        jid: entry?.jid || null
+        jid: entry?.jid || null,
       }));
+      return;
+    }
+
+    // ---- POST /unpair ----
+    if (req.method === 'POST' && url.pathname === '/unpair') {
+      const { userId, deviceId } = JSON.parse(raw || '{}');
+      if (!userId || !deviceId) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and deviceId required',
+        }));
+        return;
+      }
+      await waDropClient(userId, deviceId);
+      await waDestroyStore(userId, deviceId);
+      if (waPairedDevice.get(userId) === deviceId) {
+        waPairedDevice.delete(userId);
+      }
+      res.end(JSON.stringify({ ok: true, message: 'Unpaired.' }));
       return;
     }
 
     // ---- POST /send ---- (WhatsApp voice note)
     if (req.method === 'POST' && url.pathname === '/send') {
-      const { userId, phone, resultId } = JSON.parse(raw || '{}');
-      if (!userId || !phone || !resultId) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId, phone, resultId required' }));
+      const { userId, deviceId, phone, resultId } = JSON.parse(raw || '{}');
+      if (!userId || !deviceId || !phone || !resultId) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId, deviceId, phone, resultId required',
+        }));
         return;
       }
 
-      const entry = waClients.get(userId);
+      const entry = waEntryForDevice(userId, deviceId);
       if (!entry?.connected) {
-        res.writeHead(409).end(JSON.stringify({ ok: false, error: 'User not paired' }));
+        res.writeHead(409).end(JSON.stringify({
+          ok: false,
+          error: 'Not paired on this device',
+        }));
         return;
       }
 
@@ -259,7 +370,10 @@ const server = http.createServer(async (req, res) => {
 
       const audioRes = await fetch(`${APP_BASE_URL}/api/result/${encodeURIComponent(resultId)}`);
       if (!audioRes.ok) {
-        res.writeHead(502).end(JSON.stringify({ ok: false, error: `Audio fetch failed: ${audioRes.status}` }));
+        res.writeHead(502).end(JSON.stringify({
+          ok: false,
+          error: `Audio fetch failed: ${audioRes.status}`,
+        }));
         return;
       }
       const inputBuf = Buffer.from(await audioRes.arrayBuffer());
@@ -309,7 +423,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/tg/start-login') {
       const { userId, phone } = JSON.parse(raw || '{}');
       if (!userId || !phone) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and phone required' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and phone required',
+        }));
         return;
       }
 
@@ -341,7 +458,10 @@ const server = http.createServer(async (req, res) => {
         phoneCodeHash: result.phoneCodeHash,
       });
 
-      res.end(JSON.stringify({ ok: true, message: 'Code sent. Check your Telegram app.' }));
+      res.end(JSON.stringify({
+        ok: true,
+        message: 'Code sent. Check your Telegram app.',
+      }));
       return;
     }
 
@@ -349,13 +469,19 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/tg/verify') {
       const { userId, code } = JSON.parse(raw || '{}');
       if (!userId || !code) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and code required' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and code required',
+        }));
         return;
       }
 
       const pending = tgPendingLogins.get(userId);
       if (!pending) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'No pending login. Start over.' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'No pending login. Start over.',
+        }));
         return;
       }
 
@@ -376,11 +502,21 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         const m = err?.errorMessage || err?.message || String(err);
         if (m.includes('SESSION_PASSWORD_NEEDED')) {
-          res.end(JSON.stringify({ ok: true, passwordNeeded: true, message: '2FA password required.' }));
+          res.end(JSON.stringify({
+            ok: true,
+            passwordNeeded: true,
+            message: '2FA password required.',
+          }));
         } else if (m.includes('PHONE_CODE_INVALID')) {
-          res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Invalid code. Try again.' }));
+          res.writeHead(400).end(JSON.stringify({
+            ok: false,
+            error: 'Invalid code. Try again.',
+          }));
         } else if (m.includes('PHONE_CODE_EXPIRED')) {
-          res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Code expired. Start over.' }));
+          res.writeHead(400).end(JSON.stringify({
+            ok: false,
+            error: 'Code expired. Start over.',
+          }));
         } else {
           res.writeHead(500).end(JSON.stringify({ ok: false, error: m }));
         }
@@ -392,13 +528,19 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/tg/verify-password') {
       const { userId, password } = JSON.parse(raw || '{}');
       if (!userId || !password) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and password required' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId and password required',
+        }));
         return;
       }
 
       const pending = tgPendingLogins.get(userId);
       if (!pending) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'No pending login. Start over.' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'No pending login. Start over.',
+        }));
         return;
       }
 
@@ -416,7 +558,10 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         const m = err?.errorMessage || err?.message || String(err);
         if (m.includes('PASSWORD_HASH_INVALID')) {
-          res.writeHead(400).end(JSON.stringify({ ok: false, error: 'Wrong password.' }));
+          res.writeHead(400).end(JSON.stringify({
+            ok: false,
+            error: 'Wrong password.',
+          }));
         } else {
           res.writeHead(400).end(JSON.stringify({ ok: false, error: m }));
         }
@@ -428,7 +573,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/tg/status') {
       const userId = url.searchParams.get('userId');
       if (!userId) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId required' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId required',
+        }));
         return;
       }
       const entry = tgClients.get(userId);
@@ -446,26 +594,35 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/tg/send') {
       const { userId, to, resultId, mode } = JSON.parse(raw || '{}');
       if (!userId || !to || !resultId) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId, to, resultId required' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'userId, to, resultId required',
+        }));
         return;
       }
 
       const entry = tgClients.get(userId);
       if (!entry?.connected) {
-        res.writeHead(409).end(JSON.stringify({ ok: false, error: 'Not logged in. Please log in first.' }));
+        res.writeHead(409).end(JSON.stringify({
+          ok: false,
+          error: 'Not logged in. Please log in first.',
+        }));
         return;
       }
 
       const audioRes = await fetch(`${APP_BASE_URL}/api/result/${encodeURIComponent(resultId)}`);
       if (!audioRes.ok) {
-        res.writeHead(502).end(JSON.stringify({ ok: false, error: `Audio fetch failed: ${audioRes.status}` }));
+        res.writeHead(502).end(JSON.stringify({
+          ok: false,
+          error: `Audio fetch failed: ${audioRes.status}`,
+        }));
         return;
       }
       const inputBuf = Buffer.from(await audioRes.arrayBuffer());
 
       const tmpDir = os.tmpdir();
       const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const inPath = path.join(tmpDir, `tg-in-${stamp}.wav`);
+      const inPath  = path.join(tmpDir, `tg-in-${stamp}.wav`);
       const outPath = path.join(tmpDir, `tg-out-${stamp}.ogg`);
 
       await fs.writeFile(inPath, inputBuf);
@@ -504,7 +661,10 @@ const server = http.createServer(async (req, res) => {
       const contentType = req.headers['content-type'] || '';
       const boundaryMatch = contentType.match(/boundary=(.+)$/);
       if (!boundaryMatch) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'multipart/form-data required' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'multipart/form-data required',
+        }));
         return;
       }
 
@@ -534,13 +694,19 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (!videoBuf || !formUserId || !formTo) {
-        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'video, userId, to required' }));
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'video, userId, to required',
+        }));
         return;
       }
 
       const entry = tgClients.get(formUserId);
       if (!entry?.connected) {
-        res.writeHead(409).end(JSON.stringify({ ok: false, error: 'Not logged in.' }));
+        res.writeHead(409).end(JSON.stringify({
+          ok: false,
+          error: 'Not logged in.',
+        }));
         return;
       }
 
@@ -583,7 +749,10 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404).end(JSON.stringify({ ok: false, error: 'not found' }));
   } catch (err) {
     console.error('request failed:', err);
-    res.writeHead(500).end(JSON.stringify({ ok: false, error: err?.message || String(err) }));
+    res.writeHead(500).end(JSON.stringify({
+      ok: false,
+      error: err?.message || String(err),
+    }));
   }
 });
 
