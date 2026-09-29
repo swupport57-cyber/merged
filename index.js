@@ -1,4 +1,4 @@
-import { createClient } from '@whatsmeow-node/whatsmeow-node';
+import { createClient, WhatsmeowError } from '@whatsmeow-node/whatsmeow-node';
 import { TelegramClient, Api } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { CustomFile } from 'telegram/client/uploads.js';
@@ -40,6 +40,10 @@ const waClients = new Map();
 // different deviceId, the old pairing is invalidated before the new one is
 // created.
 const waPairedDevice = new Map();
+
+// Track in-flight pairing attempts so concurrent /pair calls don't stomp
+// on each other.
+const waPairingInFlight = new Map(); // userId -> Promise
 
 function waCacheKey(userId, deviceId) {
   return `${userId}:${deviceId}`;
@@ -115,25 +119,57 @@ async function getOrCreateWaClient(userId, deviceId) {
   if (waClients.has(key)) return waClients.get(key);
 
   const storeUrl = await waStoreUrlForUser(userId, deviceId);
-  const client = createClient({ store: storeUrl, commandTimeout: 120000 });
+  const client = createClient({
+    store: storeUrl,
+    commandTimeout: 60000, // bumped from 120000? keep 120s for initial sync
+  });
 
-  const entry = { client, jid: null, connected: false, deviceId };
+  const entry = { client, jid: null, connected: false, deviceId, loggedOut: false };
   waClients.set(key, entry);
 
   client.on('connected', ({ jid }) => {
     entry.jid = jid;
     entry.connected = true;
+    entry.loggedOut = false;
     waPairedDevice.set(userId, deviceId);
     console.log(`[WA ${userId}/${deviceId}] connected as ${jid}`);
   });
 
   client.on('disconnected', () => {
     entry.connected = false;
-    console.log(`[WA ${userId}/${deviceId}] disconnected`);
+    console.log(`[WA ${userId}/${deviceId}] disconnected (auto-reconnect will handle)`);
+  });
+
+  // CRITICAL: session was revoked. Must clear everything so the next
+  // pairing starts clean.
+  client.on('logged_out', ({ reason }) => {
+    console.warn(`[WA ${userId}/${deviceId}] logged_out reason=${reason} — invalidating session`);
+    entry.connected = false;
+    entry.loggedOut = true;
+    waPairedDevice.delete(userId);
+    waClients.delete(key);
+    waDestroyStore(userId, deviceId).catch(() => {});
+  });
+
+  // CRITICAL: protocol-level error. 401/device_removed means the same as
+  // logged_out. Log everything for debugging.
+  client.on('stream_error', ({ code }) => {
+    console.warn(`[WA ${userId}/${deviceId}] stream_error code=${code}`);
+    if (String(code) === '401' || String(code).includes('replaced') || String(code).includes('device_removed')) {
+      entry.connected = false;
+      entry.loggedOut = true;
+      waPairedDevice.delete(userId);
+      waClients.delete(key);
+      waDestroyStore(userId, deviceId).catch(() => {});
+    }
   });
 
   client.on('error', (err) => {
-    console.error(`[WA ${userId}/${deviceId}] error:`, err?.message || err);
+    const m = err?.message || String(err);
+    console.error(`[WA ${userId}/${deviceId}] error:`, m);
+    if (err instanceof WhatsmeowError && err.code === 'ERR_TIMEOUT') {
+      console.error(`[WA ${userId}/${deviceId}] command timed out — increase commandTimeout or retry`);
+    }
   });
 
   await client.init();
@@ -147,7 +183,7 @@ function waEntryForDevice(userId, deviceId) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   TELEGRAM STATE (GramJS)
+   TELEGRAM STATE (GramJS) — unchanged
    ═══════════════════════════════════════════════════════════════ */
 
 const tgClients = new Map();
@@ -280,30 +316,105 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/pair') {
       const { userId, deviceId, phone } = JSON.parse(raw || '{}');
       if (!userId || !deviceId || !phone) {
-        res.writeHead(400).end(JSON.stringify({
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId, deviceId, phone required' }));
+        return;
+      }
+
+      // STRICT DEVICE GUARD: refuse if this user is paired on another device.
+      const knownDevice = waPairedDevice.get(userId);
+      if (knownDevice && knownDevice !== deviceId) {
+        console.log(`[WA ${userId}] blocked: already paired on ${knownDevice}, requested from ${deviceId}`);
+        res.writeHead(409).end(JSON.stringify({
           ok: false,
-          error: 'userId, deviceId, phone required',
+          error: 'This number is already linked to another device. Unlink it there first.',
+          code: 'ALREADY_PAIRED_ELSEWHERE',
+        }));
+        return;
+      }
+
+      // Prevent concurrent pairing attempts for the same user.
+      if (waPairingInFlight.has(userId)) {
+        res.writeHead(429).end(JSON.stringify({
+          ok: false,
+          error: 'Pairing already in progress for this account. Wait a moment.',
+          code: 'PAIRING_IN_FLIGHT',
         }));
         return;
       }
 
       const cleanPhone = String(phone).replace(/[^0-9]/g, '');
-      const entry = await getOrCreateWaClient(userId, deviceId);
-
-      if (entry.connected) {
-        res.end(JSON.stringify({ ok: true, alreadyPaired: true, jid: entry.jid }));
+      if (cleanPhone.length < 10 || cleanPhone.length > 15) {
+        res.writeHead(400).end(JSON.stringify({
+          ok: false,
+          error: 'Invalid phone number. Use 10–15 digits with country code.',
+          code: 'BAD_PHONE',
+        }));
         return;
       }
 
-      try {
-        await entry.client.connect();
-      } catch (e) {
-        const m = String(e?.message || e);
-        if (!/already connected/i.test(m)) throw e;
-      }
+      const pairingPromise = (async () => {
+        const entry = await getOrCreateWaClient(userId, deviceId);
 
-      const code = await entry.client.pairCode(cleanPhone);
-      res.end(JSON.stringify({ ok: true, code }));
+        if (entry.connected) {
+          return { ok: true, alreadyPaired: true, jid: entry.jid };
+        }
+
+        // Step 1: connect. This is async; returns before handshake completes.
+        try {
+          await entry.client.connect();
+        } catch (e) {
+          const m = String(e?.message || e);
+          if (!/already connected/i.test(m)) throw e;
+        }
+
+        // Step 2: WAIT for the connection to actually be ready.
+        // pairCode() requires an active connection. Without this wait, we
+        // race the WebSocket handshake and WhatsApp kicks us with 401.
+        try {
+          await entry.client.waitForConnection(15000); // 15s max wait
+        } catch (e) {
+          console.warn(`[WA ${userId}/${deviceId}] waitForConnection failed:`, e.message);
+          // If it timed out but might still connect, proceed cautiously;
+          // pairCode will fail cleanly if not.
+        }
+
+        // Step 3: request the code.
+        let code;
+        try {
+          code = await entry.client.pairCode(cleanPhone);
+        } catch (e) {
+          const m = String(e?.message || e);
+          if (m.includes('conflict') || m.includes('already') || m.includes('401')) {
+            throw Object.assign(new Error('This number is already linked elsewhere. Unlink it first.'), {
+              code: 'PHONE_ALREADY_LINKED',
+            });
+          }
+          throw e;
+        }
+
+        return { ok: true, code };
+      })();
+
+      waPairingInFlight.set(userId, pairingPromise);
+
+      try {
+        const result = await pairingPromise;
+        if (result.alreadyPaired) {
+          res.end(JSON.stringify(result));
+        } else {
+          res.end(JSON.stringify(result));
+        }
+      } catch (e) {
+        const code = e.code || null;
+        const status = code === 'ALREADY_PAIRED_ELSEWHERE' || code === 'PHONE_ALREADY_LINKED' ? 409 : 500;
+        res.writeHead(status).end(JSON.stringify({
+          ok: false,
+          error: e.message || String(e),
+          code,
+        }));
+      } finally {
+        waPairingInFlight.delete(userId);
+      }
       return;
     }
 
@@ -312,10 +423,7 @@ const server = http.createServer(async (req, res) => {
       const userId = url.searchParams.get('userId');
       const deviceId = url.searchParams.get('deviceId');
       if (!userId || !deviceId) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId and deviceId required',
-        }));
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and deviceId required' }));
         return;
       }
       const entry = waEntryForDevice(userId, deviceId);
@@ -323,6 +431,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         connected: !!entry?.connected,
         jid: entry?.jid || null,
+        loggedOut: !!entry?.loggedOut,
       }));
       return;
     }
@@ -331,10 +440,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/unpair') {
       const { userId, deviceId } = JSON.parse(raw || '{}');
       if (!userId || !deviceId) {
-        res.writeHead(400).end(JSON.stringify({
-          ok: false,
-          error: 'userId and deviceId required',
-        }));
+        res.writeHead(400).end(JSON.stringify({ ok: false, error: 'userId and deviceId required' }));
         return;
       }
       await waDropClient(userId, deviceId);
@@ -417,7 +523,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    /* ═══════════════ TELEGRAM ROUTES ═══════════════ */
+    /* ═══════════════ TELEGRAM ROUTES (unchanged) ═══════════════ */
 
     // ---- POST /tg/start-login ----
     if (req.method === 'POST' && url.pathname === '/tg/start-login') {
