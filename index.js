@@ -108,6 +108,7 @@ async function getOrCreateWaClient(userId, deviceId) {
 
   if (waClients.has(key)) return waClients.get(key);
 
+  console.log(`[WA ${userId}/${deviceId}] creating client`);
   const storeUrl = await waStoreUrlForUser(userId, deviceId);
   const client = createClient({
     store: storeUrl,
@@ -122,16 +123,16 @@ async function getOrCreateWaClient(userId, deviceId) {
     entry.connected = true;
     entry.loggedOut = false;
     waPairedDevice.set(userId, deviceId);
-    console.log(`[WA ${userId}/${deviceId}] connected as ${jid}`);
+    console.log(`[WA ${userId}/${deviceId}] EVENT connected as ${jid}`);
   });
 
   client.on('disconnected', () => {
     entry.connected = false;
-    console.log(`[WA ${userId}/${deviceId}] disconnected (auto-reconnect will handle)`);
+    console.log(`[WA ${userId}/${deviceId}] EVENT disconnected (auto-reconnect will handle)`);
   });
 
   client.on('logged_out', ({ reason }) => {
-    console.warn(`[WA ${userId}/${deviceId}] logged_out reason=${reason} — invalidating session`);
+    console.warn(`[WA ${userId}/${deviceId}] EVENT logged_out reason=${reason} — invalidating session`);
     entry.connected = false;
     entry.loggedOut = true;
     waPairedDevice.delete(userId);
@@ -140,7 +141,7 @@ async function getOrCreateWaClient(userId, deviceId) {
   });
 
   client.on('stream_error', ({ code }) => {
-    console.warn(`[WA ${userId}/${deviceId}] stream_error code=${code}`);
+    console.warn(`[WA ${userId}/${deviceId}] EVENT stream_error code=${code}`);
     if (String(code) === '401' || String(code).includes('replaced') || String(code).includes('device_removed')) {
       entry.connected = false;
       entry.loggedOut = true;
@@ -152,13 +153,15 @@ async function getOrCreateWaClient(userId, deviceId) {
 
   client.on('error', (err) => {
     const m = err?.message || String(err);
-    console.error(`[WA ${userId}/${deviceId}] error:`, m);
+    console.error(`[WA ${userId}/${deviceId}] EVENT error:`, m);
     if (err instanceof WhatsmeowError && err.code === 'ERR_TIMEOUT') {
-      console.error(`[WA ${userId}/${deviceId}] command timed out — increase commandTimeout or retry`);
+      console.error(`[WA ${userId}/${deviceId}] command timed out`);
     }
   });
 
+  console.log(`[WA ${userId}/${deviceId}] calling init()`);
   await client.init();
+  console.log(`[WA ${userId}/${deviceId}] init() returned, connected=${entry.connected}`);
   return entry;
 }
 
@@ -168,24 +171,22 @@ function waEntryForDevice(userId, deviceId) {
   return waClients.get(waCacheKey(userId, deviceId)) || null;
 }
 
-// Helper that waits for the client's WebSocket to actually be ready.
-// This is what the standalone code uses and what makes pairing work.
-function waWaitForConnection(entry, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    if (entry.connected) return resolve(true);
-
-    const timer = setTimeout(() => {
-      entry.client.removeListener('connected', onConnected);
-      reject(new Error('Connection timeout — WhatsApp server did not respond'));
-    }, timeoutMs);
-
-    const onConnected = () => {
-      clearTimeout(timer);
-      resolve(true);
-    };
-
-    entry.client.once('connected', onConnected);
-  });
+/**
+ * Poll entry.connected instead of relying on the 'connected' event.
+ * The event can fire before we attach a listener, or not fire at all on
+ * some library versions. Polling the flag is deterministic.
+ */
+async function waWaitForConnection(entry, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (entry.connected) {
+      console.log(`[WA] connection flag became true after ${Date.now() - start}ms`);
+      return true;
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  console.warn(`[WA] connection timeout after ${timeoutMs}ms, entry.connected=${entry.connected}`);
+  return false;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -357,38 +358,47 @@ const server = http.createServer(async (req, res) => {
       }
 
       const pairingPromise = (async () => {
+        console.log(`[WA ${userId}/${deviceId}] pair: start`);
         const entry = await getOrCreateWaClient(userId, deviceId);
 
         if (entry.connected) {
+          console.log(`[WA ${userId}/${deviceId}] pair: already connected`);
           return { ok: true, alreadyPaired: true, jid: entry.jid };
         }
 
-        // Step 1: connect (async, returns before the handshake completes)
+        // Step 1: connect
+        console.log(`[WA ${userId}/${deviceId}] pair: calling connect()`);
         try {
           await entry.client.connect();
+          console.log(`[WA ${userId}/${deviceId}] pair: connect() resolved`);
         } catch (e) {
           const m = String(e?.message || e);
-          if (!/already connected/i.test(m)) throw e;
+          if (!/already connected/i.test(m)) {
+            console.log(`[WA ${userId}/${deviceId}] pair: connect() threw: ${m}`);
+            throw e;
+          }
+          console.log(`[WA ${userId}/${deviceId}] pair: connect() says already connected`);
         }
 
-        // Step 2: WAIT for the connection to be genuinely ready.
-        // Use the helper, not a method on the client.
-        try {
-          await waWaitForConnection(entry, 15000);
-        } catch (e) {
-          console.warn(`[WA ${userId}/${deviceId}] waitForConnection failed:`, e.message);
+        // Step 2: wait for connected flag
+        console.log(`[WA ${userId}/${deviceId}] pair: waiting for connected flag`);
+        const ok = await waWaitForConnection(entry, 30000);
+        if (!ok) {
           throw Object.assign(
-            new Error('WhatsApp server did not respond. Try again.'),
+            new Error('WhatsApp server did not respond within 30s. Try again.'),
             { code: 'WA_CONNECT_TIMEOUT' }
           );
         }
 
-        // Step 3: request the code.
+        // Step 3: pairCode
+        console.log(`[WA ${userId}/${deviceId}] pair: calling pairCode(${cleanPhone})`);
         try {
           const code = await entry.client.pairCode(cleanPhone);
+          console.log(`[WA ${userId}/${deviceId}] pair: pairCode returned`);
           return { ok: true, code };
         } catch (e) {
           const m = String(e?.message || e);
+          console.log(`[WA ${userId}/${deviceId}] pair: pairCode threw: ${m}`);
           if (m.includes('conflict') || m.includes('already') || m.includes('401')) {
             throw Object.assign(
               new Error('This number is already linked elsewhere. Unlink it first.'),
@@ -410,6 +420,7 @@ const server = http.createServer(async (req, res) => {
           code === 'ALREADY_PAIRED_ELSEWHERE' || code === 'PHONE_ALREADY_LINKED' ? 409 :
           code === 'WA_CONNECT_TIMEOUT' ? 504 :
           500;
+        console.error(`[WA ${userId}] pair: failed with code=${code} msg=${e.message}`);
         res.writeHead(status).end(JSON.stringify({
           ok: false,
           error: e.message || String(e),
@@ -699,7 +710,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ---- POST /tg/send ---- (Telegram voice note from resultId)
+    // ---- POST /tg/send ----
     if (req.method === 'POST' && url.pathname === '/tg/send') {
       const { userId, to, resultId, mode } = JSON.parse(raw || '{}');
       if (!userId || !to || !resultId) {
@@ -765,7 +776,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ---- POST /tg/send-video ---- (multipart)
+    // ---- POST /tg/send-video ----
     if (req.method === 'POST' && url.pathname === '/tg/send-video') {
       const contentType = req.headers['content-type'] || '';
       const boundaryMatch = contentType.match(/boundary=(.+)$/);
