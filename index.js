@@ -65,7 +65,29 @@ pool?.on('error', (e) => console.error('pg pool error:', e.message));
 class HttpError extends Error {
   constructor(status, message, extra = {}) { super(message); this.status = status; this.extra = extra; }
 }
-const reauth = () => new HttpError(401, 'Please sign in again on this device.', { reauth: true });
+const reauth = (reason = 'unknown') => new HttpError(
+  401,
+  reason === 'missing_token'
+    ? 'Please sign in again on this device. (the server did not receive your device token)'
+    : 'Please sign in again on this device.',
+  { reauth: true, reason }
+);
+
+// Token can come from the X-Device-Token header, "Authorization: Bearer", or a JSON body field "deviceToken".
+function extractToken(req, body) {
+  const h = req.headers[DEVICE_HEADER];
+  if (typeof h === 'string' && h) return h;
+  const auth = req.headers.authorization;
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  const ct = String(req.headers['content-type'] || '');
+  if (body?.length && ct.includes('application/json')) {
+    try {
+      const t = JSON.parse(body.toString('utf8')).deviceToken;
+      if (typeof t === 'string' && t) return t;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
 
 function withTimeout(promise, ms, label) {
   let t;
@@ -220,18 +242,20 @@ async function issueDevice(platform) {
 }
 
 function deviceFromReq(req, platform) {
-  const token = req.headers[DEVICE_HEADER];
-  if (typeof token !== 'string' || !token || token.length > 200) return null;
+  const token = req.deviceToken;
+  if (typeof token !== 'string' || !token || token.length > 200) { req.authReason = 'missing_token'; return null; }
   const sid = byHash.get(sha(token));
   const rec = sid && devices.get(sid);
-  if (!rec || rec.platform !== platform) return null;
+  if (!rec) { req.authReason = 'unknown_token'; return null; }
+  if (rec.platform !== platform) { req.authReason = 'wrong_platform'; return null; }
   rec.lastSeen = Date.now();
   return rec;
 }
 
 const requireVerifiedDevice = (req, platform) => {
   const rec = deviceFromReq(req, platform);
-  if (!rec || !rec.verified) throw reauth();
+  if (!rec) throw reauth(req.authReason);
+  if (!rec.verified) throw reauth('not_verified');
   return rec;
 };
 
@@ -348,14 +372,14 @@ async function waGetOrCreate(sid) {
   return p;
 }
 
-async function waEnsureConnected(entry) {
+async function waEnsureConnected(entry, expectLogin = false) {
   if (entry.connected) return;
   try {
     await withTimeout(entry.client.connect(), CONNECT_TIMEOUT, 'connect');
   } catch (e) {
     if (!/already connected/i.test(String(e?.message))) throw e;
   }
-  for (let i = 0; i < 20 && !entry.connected && entry.jid; i++) await sleep(250);
+  for (let i = 0; i < 24 && !entry.connected && (entry.jid || expectLogin); i++) await sleep(250);
 }
 
 async function waRestoreAll() {
@@ -364,7 +388,7 @@ async function waRestoreAll() {
   for (const sid of sids) {
     try {
       const entry = await waGetOrCreate(sid);
-      if (entry.jid) await waEnsureConnected(entry);
+      await waEnsureConnected(entry, true);
     } catch (e) {
       console.error(`[wa ${short(sid)}] restore failed:`, e.message);
     }
@@ -392,8 +416,8 @@ async function waPair(ctx) {
     const entry = await waGetOrCreate(rec.sid);
     log('store opened');
 
-    if (entry.jid && rec.verified) {
-      await waEnsureConnected(entry);
+    if (rec.verified) {
+      await waEnsureConnected(entry, true);
       if (entry.connected) {
         log('already paired');
         return json(ctx.res, 200, { ok: true, alreadyPaired: true, jid: entry.jid, ...(newToken && { deviceToken: newToken }) });
@@ -418,17 +442,17 @@ async function waPair(ctx) {
 
 async function waStatus(ctx) {
   const rec = deviceFromReq(ctx.req, 'wa');
-  if (!rec) return json(ctx.res, 200, { ok: true, connected: false, paired: false, signInRequired: true });
+  if (!rec) return json(ctx.res, 200, { ok: true, connected: false, paired: false, signInRequired: true, reason: ctx.req.authReason });
 
   let entry = waClients.get(rec.sid);
   if (!entry && rec.verified) entry = await waGetOrCreate(rec.sid).catch(() => null);
-  if (entry?.jid && !entry.connected) await waEnsureConnected(entry).catch(() => {});
+  if (entry && (entry.jid || rec.verified) && !entry.connected) await waEnsureConnected(entry, rec.verified).catch(() => {});
   if (entry?.connected && !rec.verified) await markVerified(rec.sid);
 
   json(ctx.res, 200, {
     ok: true,
     connected: !!entry?.connected,
-    paired: !!entry?.jid && rec.verified,
+    paired: rec.verified && (!!entry?.jid || !!entry?.connected),
     jid: rec.verified ? entry?.jid || null : null,
     signInRequired: false,
   });
@@ -440,8 +464,7 @@ async function waSend(ctx) {
   if (!phone || !resultId) throw new HttpError(400, 'phone, resultId required');
 
   const entry = await waGetOrCreate(rec.sid);
-  if (!entry.jid) throw reauth();
-  await waEnsureConnected(entry);
+  await waEnsureConnected(entry, true);
   if (!entry.connected) throw new HttpError(409, 'WhatsApp not connected yet, retry shortly');
 
   const to = String(phone).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
@@ -611,7 +634,7 @@ function requireTg() {
 // For verify steps: the device must hold the token that started this login.
 function requirePendingLogin(req) {
   const rec = deviceFromReq(req, 'tg');
-  if (!rec) throw reauth();
+  if (!rec) throw reauth(req.authReason);
   const pending = tgPendingLogins.get(rec.sid);
   if (!pending) throw new HttpError(400, 'No pending login. Start over.');
   return { rec, pending };
@@ -699,7 +722,7 @@ async function tgVerifyPassword(ctx) {
 async function tgStatus(ctx) {
   requireTg();
   const rec = deviceFromReq(ctx.req, 'tg');
-  if (!rec) return json(ctx.res, 200, { ok: true, connected: false, hasSavedSession: false, signInRequired: true });
+  if (!rec) return json(ctx.res, 200, { ok: true, connected: false, hasSavedSession: false, signInRequired: true, reason: ctx.req.authReason });
 
   let entry = tgClients.get(rec.sid);
   if (!entry && rec.verified) entry = await tgRestore(rec.sid).catch(() => null);
@@ -893,7 +916,7 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Secret, X-Device-Token');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Secret, X-Device-Token, Authorization');
 
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
 
@@ -913,9 +936,11 @@ const server = http.createServer(async (req, res) => {
 
     res.setHeader('Cache-Control', 'no-store');
     const body = route.limit ? await readBody(req, route.limit) : Buffer.alloc(0);
+    req.deviceToken = extractToken(req, body);
     await route.fn({ req, res, url, body });
   } catch (err) {
     const status = err instanceof HttpError ? err.status : 500;
+    if (err?.extra?.reauth) console.warn(`[auth] ${req.method} ${String(req.url).split('?')[0]} -> ${err.extra.reason}`);
     if (status >= 500) console.error('request failed:', err);
     json(res, status, { ok: false, error: err?.message || String(err), ...(err instanceof HttpError ? err.extra : {}) });
   }
